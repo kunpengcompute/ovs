@@ -42,6 +42,13 @@
 #include "ct-dpif.h"
 #include "dp-packet.h"
 #include "util.h"
+#include "dpif-netdev.h"
+
+#if HAVE_XPF
+#include <xpf_hook.h>
+#include <xpf_hook_arg.h>
+
+#endif
 
 struct tcp_peer {
     uint32_t               seqlo;          /* Max sequence number sent     */
@@ -144,6 +151,80 @@ tcp_get_wscale(const struct tcp_header *tcp)
     return wscale;
 }
 
+#if HAVE_XPF
+static enum ct_update_res
+tcp_conn_update_skip_sequence_check(struct conntrack *ct, struct conn *conn_,
+									struct dp_packet *pkt, bool reply, long long now)
+{
+	struct conn_tcp *conn = conn_tcp_cast(conn_);
+	struct tcp_header *tcp = dp_packet_l4(pkt);
+	/* The peer that sent 'pkt' */
+	struct tcp_peer *src = &conn->peer[reply ? 1 : 0];
+	/* The peer that should receive 'pkt' */
+	struct tcp_peer *dst = &conn->peer[reply ? 0 : 1];
+	uint64_t tcp_flags = TCP_FLAGS(tcp->tcp_ctl);
+	struct ct_hook_update_arg hook_arg;
+
+	if (tcp_invalid_flags(tcp_flags)) {
+		return CT_UPDATE_INVALID;
+	}
+
+	if(((tcp_flags & (TCP_SYN | TCP_ACK))== TCP_SYN)
+		&& dst->state >= CT_DPIF_TCPS_CLOSING
+		&& src->state >= CT_DPIF_TCPS_CLOSING) {
+		src->state = dst->state = CT_DPIF_TCPS_CLOSED;
+		return CT_UPDATE_NEW;
+	}
+	
+	/* update states */
+	if (src->state < CT_DPIF_TCPS_SYN_SENT) {
+		/*	First packet from this end. Set its state */
+		src->state = CT_DPIF_TCPS_SYN_SENT;
+	}
+
+	if ((tcp_flags & TCP_FIN) && src->state < CT_DPIF_TCPS_CLOSING) {
+		src->state = CT_DPIF_TCPS_CLOSING;
+	}
+
+	if(tcp_flags & TCP_ACK) {
+		if(dst->state == CT_DPIF_TCPS_SYN_SENT) {
+			dst->state = CT_DPIF_TCPS_ESTABLISHED;
+		} else if(dst->state == CT_DPIF_TCPS_CLOSING) {
+			dst->state = CT_DPIF_TCPS_TIME_WAIT;
+		}
+	}
+
+	if (tcp_flags & TCP_RST) {
+		src->state = dst->state = CT_DPIF_TCPS_TIME_WAIT;
+	}
+
+	if (src->state >= CT_DPIF_TCPS_FIN_WAIT_2
+		&& dst->state >= CT_DPIF_TCPS_FIN_WAIT_2) {
+		conn_update_expiration(ct, &conn->up, CT_TM_TCP_CLOSED, now);
+	} else if (src->state >= CT_DPIF_TCPS_CLOSING
+			    && dst->state >= CT_DPIF_TCPS_CLOSING) {
+		conn_update_expiration(ct, &conn->up, CT_TM_TCP_FIN_WAIT, now);
+	} else if (src->state < CT_DPIF_TCPS_ESTABLISHED
+				|| dst->state < CT_DPIF_TCPS_ESTABLISHED) {
+		conn_update_expiration(ct, &conn->up, CT_TM_TCP_OPENING, now);
+	} else if (src->state >= CT_DPIF_TCPS_CLOSING
+				|| dst->state >= CT_DPIF_TCPS_CLOSING) {
+		conn_update_expiration(ct, &conn->up, CT_TM_TCP_CLOSING, now);
+	} else {
+		conn_update_expiration(ct, &conn->up, CT_TM_TCP_ESTABLISHED, now);
+	}
+
+	hook_arg.pkt = pkt;
+	hook_arg.ct_zone = conn_->key.zone;
+	hook_arg.ct_state = CS_ESTABLISHED | CS_TRACKED;
+	hook_arg.protocol_state = src->state;
+	hook_arg.seq = conn_->offload.seq;
+	xpf_hook_run_without_filter(get_hook_ovs_pkt(), PKT_HOOK_UPDATE_CT, &hook_arg);
+
+	return CT_UPDATE_VALID;
+}
+#endif
+
 static enum ct_update_res
 tcp_conn_update(struct conntrack *ct, struct conn *conn_,
                 struct dp_packet *pkt, bool reply, long long now)
@@ -160,6 +241,11 @@ tcp_conn_update(struct conntrack *ct, struct conn *conn_,
     uint16_t win = ntohs(tcp->tcp_winsz);
     uint32_t ack, end, seq, orig_seq;
     uint32_t p_len = tcp_payload_length(pkt);
+#if HAVE_XPF
+	if (ct->offload_is_on) {
+		return tcp_conn_update_skip_sequence_check(ct, conn_, pkt, reply, now);
+	}
+#endif
 
     if (tcp_invalid_flags(tcp_flags)) {
         return CT_UPDATE_INVALID;

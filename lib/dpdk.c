@@ -107,6 +107,7 @@ construct_dpdk_options(const struct smap *ovs_other_config, struct svec *args)
         {"dpdk-lcore-mask",   "-c",             false, NULL},
         {"dpdk-hugepage-dir", "--huge-dir",     false, NULL},
         {"dpdk-socket-limit", "--socket-limit", false, NULL},
+		{"dpdk-pmd-driver", "-d", false, NULL},
     };
 
     int i;
@@ -439,17 +440,10 @@ dpdk_init__(const struct smap *ovs_other_config)
 
 #ifdef DPDK_PDUMP
     VLOG_INFO("DPDK pdump packet capture enabled");
-    err = rte_pdump_init(ovs_rundir());
+    err = rte_pdump_init();
     if (err) {
         VLOG_INFO("Error initialising DPDK pdump");
         rte_pdump_uninit();
-    } else {
-        char *server_socket_path;
-
-        server_socket_path = xasprintf("%s/%s", ovs_rundir(),
-                                       "pdump_server_socket");
-        fatal_signal_add_file_to_unlink(server_socket_path);
-        free(server_socket_path);
     }
 #endif
 

@@ -69,6 +69,36 @@ struct ovs_vswitchd_exit_args {
     bool *cleanup;
 };
 
+#if HAVE_XPF
+#define VENDOR_HISILICON   0x48
+#define VENDOR_ARM         0x41
+#define PART_ID_MASK       0xFFF
+#define PART_ID_OFFSET     4
+#define VENDOR_MASK        0xFF
+#define VENDOR_OFFSET      24
+
+unsigned int g_support_vendor_list[] = {VENDOR_HISILICON, VENDOR_ARM};
+static bool platform_compat_check(void)
+{
+	unsigned long int midr_el1;
+	unsigned int part_id;
+	unsigned int vendor_id;
+	unsigned int i;
+
+	asm("mrs %0, MIDR_EL1": "=r" (midr_el1));
+	part_id = (midr_el1 >> PART_ID_OFFSET) & PART_ID_MASK;
+	vendor_id = (midr_el1 >> VENDOR_OFFSET) & VENDOR_MASK;
+
+	VLOG_INFO("midr_el1=0x%016lx, part_id=0x%x, vendor_id=0x%x", midr_el1, part_id, vendor_id);
+	for (i = 0; i < ARRAY_SIZE(g_support_vendor_list); i++) {
+	    if (g_support_vendor_list[i] == vendor_id) {
+		    return true;
+		}
+	}
+	return false;
+}
+#endif
+
 int
 main(int argc, char *argv[])
 {
@@ -78,6 +108,14 @@ main(int argc, char *argv[])
     bool exiting, cleanup;
     struct ovs_vswitchd_exit_args exit_args = {&exiting, &cleanup};
     int retval;
+
+#if HAVE_XPF
+	bool flag = platform_compat_check();
+	if (!flag) {
+	    VLOG_ERR("program_compatibility_check fail");
+		return -1;
+	}
+#endif
 
     set_program_name(argv[0]);
     ovsthread_id_init();

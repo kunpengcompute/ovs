@@ -47,6 +47,9 @@ enum OVS_PACKED_ENUM dp_packet_source {
 };
 
 #define DP_PACKET_CONTEXT_SIZE 64
+#ifdef HAVE_XPF
+#define PKT_RX_HW_OFFLOAD_INFO (1ULL << 39)
+#endif /* HAVE_XPF */
 
 #ifndef DPDK_NETDEV
 /* Bit masks for the 'ol_flags' member of the 'dp_packet' structure. */
@@ -538,7 +541,11 @@ dp_packet_rss_valid(const struct dp_packet *p)
 static inline void
 dp_packet_reset_offload(struct dp_packet *p)
 {
+#ifdef HAVE_XPF
+	p->mbuf.ol_flags &= PKT_RX_HW_OFFLOAD_INFO;
+#else
     p->mbuf.ol_flags = 0;
+#endif
 }
 
 static inline bool

@@ -88,6 +88,14 @@ enum OVS_PACKED_ENUM ct_conn_type {
     CT_CONN_TYPE_UN_NAT,
 };
 
+#if HAVE_XPF
+enum {
+	CT_DIR_ORIGIN,
+	CT_DIR_REPLY,
+	CT_DIR_MAX
+};
+#endif
+
 struct conn {
     /* Immutable data. */
     struct conn_key key;
@@ -112,6 +120,17 @@ struct conn {
     /* Immutable data. */
     bool alg_related; /* True if alg data connection. */
     enum ct_conn_type conn_type;
+
+#if HAVE_XPF
+	struct {
+		/**
+		 * Seq is used to distinguish connection which is
+		 * closed and opened again with the same 5 tuple
+		 */
+		uint64_t seq;
+		uint64_t hw_ufid[CT_DIR_MAX];
+	} offload;
+#endif
 };
 
 enum ct_update_res {
@@ -159,6 +178,12 @@ struct conntrack {
     pthread_t clean_thread; /* Periodically cleans up connection tracker. */
     struct latch clean_thread_exit; /* To destroy the 'clean_thread'. */
 
+#if HAVE_XPF
+	/* Increase this sequence once a new connection created */
+	uint64_t seq;
+	bool offload_is_on; /*offload is enabled */
+#endif
+
     /* Counting connections. */
     atomic_count n_conn; /* Number of connections currently tracked. */
     atomic_uint n_conn_limit; /* Max connections tracked. */
@@ -195,6 +220,10 @@ struct ct_l4_proto {
                                       long long now);
     void (*conn_get_protoinfo)(const struct conn *,
                                struct ct_dpif_protoinfo *);
+#if HAVE_XPF
+	void (*conn_state_sync)(struct conntrack * ct, struct conn *conn, bool reply,
+							long long hw_last_used);
+#endif
 };
 
 extern long long ct_timeout_val[];

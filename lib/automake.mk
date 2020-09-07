@@ -20,6 +20,10 @@ lib_libopenvswitch_la_LDFLAGS = \
         -Wl,--version-script=$(top_builddir)/lib/libopenvswitch.sym \
         $(AM_LDFLAGS)
 
+if HAVE_XPF
+lib_libopenvswitch_la_LDFLAGS += -lxpf -lxpf_hwoff_frame
+endif
+
 lib_libopenvswitch_la_SOURCES = \
 	lib/aes128.c \
 	lib/aes128.h \

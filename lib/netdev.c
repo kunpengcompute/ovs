@@ -125,6 +125,19 @@ netdev_is_pmd(const struct netdev *netdev)
     return netdev->netdev_class->is_pmd;
 }
 
+#ifdef HAVE_XPF
+bool
+netdev_is_hwoff(const struct netdev *netdev)
+{
+	if (!strncmp(netdev->netdev_class->type, "hwbond", strlen("hwbond")) ||
+		!strncmp(netdev->netdev_class->type, "virtio_vf", strlen("virtio_vf"))) {
+		return true;
+	}
+
+	return false;
+}
+#endif
+
 bool
 netdev_has_tunnel_push_pop(const struct netdev *netdev)
 {
@@ -214,6 +227,27 @@ netdev_lookup_class(const char *type)
         }
     }
     return NULL;
+}
+
+/* Extracts pointers to all 'netdev-offload' into an shash
+ *
+ * The caller must close
+ * each 'netdev-offload' in the list. */
+void netdev_get_devices_by_type(const char *type, struct shash *device_list)
+	OVS_EXCLUDED(netdev_mutex)
+{
+	struct shash_node *node;
+	struct netdev *dev = NULL;
+
+	ovs_mutex_lock(&netdev_mutex);
+	SHASH_FOR_EACH (node, &netdev_shash) {
+		dev = node->data;
+		if (!strcmp(dev->netdev_class->type, type)) {
+			dev->ref_cnt++;
+			shash_add(device_list, dev->name, dev);
+		}
+	}
+	ovs_mutex_unlock(&netdev_mutex);
 }
 
 /* Initializes and registers a new netdev provider.  After successful

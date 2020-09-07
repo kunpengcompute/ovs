@@ -34,6 +34,7 @@ extern "C" {
 enum { DP_NETDEV_HEADROOM = 2 + VLAN_HEADER_LEN };
 
 bool dpif_is_netdev(const struct dpif *);
+odp_port_t dpif_netdev_get_odp_no_by_name(const char *devname);
 
 #define NR_QUEUE   1
 #define NR_PMD_THREADS 1
@@ -41,5 +42,8 @@ bool dpif_is_netdev(const struct dpif *);
 #ifdef  __cplusplus
 }
 #endif
+
+void *get_hook_ovs_flow(void);
+void *get_hook_ovs_pkt(void);
 
 #endif /* netdev.h */

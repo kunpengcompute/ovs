@@ -35,6 +35,7 @@
 #include <openvswitch/thread.h>
 #include <openvswitch/token-bucket.h>
 #include <openvswitch/util.h>
+#include <openvswitch/dynamic-string.h>
 
 #ifdef  __cplusplus
 extern "C" {
@@ -299,6 +300,10 @@ void vlog_usage(void);
             *(ERRP) = xasprintf(__VA_ARGS__);                           \
         }                                                               \
     } while (0)
+void format_log_message(const struct vlog_module *, enum vlog_level,
+                              const char *pattern,
+                              const char *message, va_list, struct ds *)
+    OVS_PRINTF_FORMAT(4, 0);
 
 #ifdef  __cplusplus
 }

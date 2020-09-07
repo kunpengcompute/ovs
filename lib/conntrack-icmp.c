@@ -23,6 +23,12 @@
 
 #include "conntrack-private.h"
 #include "dp-packet.h"
+#include "dpif-netdev.h"
+
+#if HAVE_XPF
+#include <xpf_hook.h>
+#include <xpf_hook_arg.h>
+#endif
 
 enum OVS_PACKED_ENUM icmp_state {
     ICMPS_FIRST,
@@ -50,8 +56,22 @@ icmp_conn_update(struct conntrack *ct, struct conn *conn_,
                  struct dp_packet *pkt OVS_UNUSED, bool reply, long long now)
 {
     struct conn_icmp *conn = conn_icmp_cast(conn_);
+#if HAVE_XPF
+	struct ct_hook_update_arg hook_arg;
+#endif
     conn->state = reply ? ICMPS_REPLY : ICMPS_FIRST;
     conn_update_expiration(ct, &conn->up, icmp_timeouts[conn->state], now);
+
+#if HAVE_XPF
+	if (pkt) {
+	    hook_arg.pkt = pkt;
+		hook_arg.ct_zone = conn_->key.zone;
+		hook_arg.ct_state = CS_ESTABLISHED | CS_TRACKED;
+		hook_arg.protocol_state = conn->state;
+		hook_arg.seq = conn_->offload.seq;
+		xpf_hook_run_without_filter(get_hook_ovs_pkt(), PKT_HOOK_UPDATE_CT, &hook_arg);
+	}
+#endif
 
     return CT_UPDATE_VALID;
 }
@@ -85,14 +105,27 @@ icmp_new_conn(struct conntrack *ct, struct dp_packet *pkt OVS_UNUSED,
     return &conn->up;
 }
 
+#if HAVE_XPF
+static void icmp_conn_state_sync(struct conntrack *ct, struct conn *conn, bool reply, long long hw_last_used)
+{
+	icmp_conn_update(ct, conn, NULL, reply, hw_last_used);
+}
+#endif
+
 struct ct_l4_proto ct_proto_icmp4 = {
     .new_conn = icmp_new_conn,
     .valid_new = icmp4_valid_new,
     .conn_update = icmp_conn_update,
+#if HAVE_XPF
+	.conn_state_sync = icmp_conn_state_sync,
+#endif
 };
 
 struct ct_l4_proto ct_proto_icmp6 = {
     .new_conn = icmp_new_conn,
     .valid_new = icmp6_valid_new,
     .conn_update = icmp_conn_update,
+#if HAVE_XPF
+	.conn_state_sync = icmp_conn_state_sync,
+#endif
 };

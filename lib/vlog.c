@@ -152,7 +152,7 @@ static struct vlog_facility vlog_facilities[] = {
 };
 static bool vlog_facility_exists(const char* facility, int *value);
 
-static void format_log_message(const struct vlog_module *, enum vlog_level,
+void format_log_message(const struct vlog_module *, enum vlog_level,
                                const char *pattern,
                                const char *message, va_list, struct ds *)
     OVS_PRINTF_FORMAT(4, 0);
@@ -946,7 +946,7 @@ fetch_braces(const char *p, const char *def, char *out, size_t out_size)
     return p;
 }
 
-static void
+void
 format_log_message(const struct vlog_module *module, enum vlog_level level,
                    const char *pattern, const char *message,
                    va_list args_, struct ds *s)

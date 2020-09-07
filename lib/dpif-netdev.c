@@ -80,6 +80,15 @@
 #include "util.h"
 #include "uuid.h"
 
+#if HAVE_XPF
+#include <xpf_config.h>
+#include <xpf_component.h>
+#include <xpf_component_arg.h>
+#include <xpf_hook.h>
+#include <xpf_hook_arg.h>
+#include <hwoff_init.h>
+#endif
+
 VLOG_DEFINE_THIS_MODULE(dpif_netdev);
 
 /* Auto Load Balancing Defaults */
@@ -128,6 +137,19 @@ static struct odp_support dp_netdev_support = {
     .ct_orig_tuple = true,
     .ct_orig_tuple6 = true,
 };
+
+void *hook_provider_ovs_flow;
+void *hook_provider_ovs_pkt;
+
+void *get_hook_ovs_flow(void)
+{
+    return hook_provider_ovs_flow;
+}
+
+void *get_hook_ovs_pkt(void)
+{
+    return hook_provider_ovs_pkt;
+}
 
 /* EMC cache and SMC cache compose the datapath flow cache (DFC)
  *
@@ -526,6 +548,7 @@ struct dp_netdev_flow {
     struct ovs_refcount ref_cnt;
 
     bool dead;
+	bool offloadable;
     uint32_t mark;               /* Unique flow mark assigned to a flow */
 
     /* Statistics. */
@@ -857,6 +880,9 @@ static inline bool
 pmd_perf_metrics_enabled(const struct dp_netdev_pmd_thread *pmd);
 static void queue_netdev_flow_del(struct dp_netdev_pmd_thread *pmd,
                                   struct dp_netdev_flow *flow);
+#ifdef HAVE_XPF
+static void dpif_netdev_init_xpf(void);
+#endif
 
 static void
 emc_cache_init(struct emc_cache *flow_cache)
@@ -1415,7 +1441,11 @@ dpif_netdev_init(void)
                              "on|off [-b before] [-a after] [-e|-ne] "
                              "[-us usec] [-q qlen]",
                              0, 10, pmd_perf_log_set_cmd,
-                             NULL);
+							 NULL);
+
+#ifdef HAVE_XPF
+	dpif_netdev_init_xpf();
+#endif
     return 0;
 }
 
@@ -1574,6 +1604,18 @@ create_dp_netdev(const char *name, const struct dpif_class *class,
         return error;
     }
 
+#ifdef DPDK_NETDEV
+	if (dpdk_shared_mp_init() != 0) {
+		VLOG_ERR("Failed to init shared memory pool.");
+		dp_netdev_free(dp);
+		return -1;
+	}
+
+#ifdef HAVE_XPF
+	hwoff_offload_component_load_hook();
+#endif /* HAVE_XPF */
+#endif
+
     dp->last_tnl_conf_seq = seq_read(tnl_conf_seq);
     *dpp = dp;
     return 0;
@@ -1685,7 +1727,9 @@ dp_netdev_free(struct dp_netdev *dp)
     for (i = 0; i < N_METER_LOCKS; ++i) {
         ovs_mutex_destroy(&dp->meter_locks[i]);
     }
-
+#ifdef DPDK_NETDEV
+	(void)dpdk_shared_mp_uninit();
+#endif
     free(dp->pmd_cmask);
     free(CONST_CAST(char *, dp->name));
     free(dp);
@@ -1988,6 +2032,25 @@ get_port_by_name(struct dp_netdev *dp,
     /* Callers of dpif_netdev_port_query_by_name() expect ENODEV for a non
      * existing port. */
     return ENODEV;
+}
+
+odp_port_t
+dpif_netdev_get_odp_no_by_name(const char *devname)
+{
+	struct dp_netdev_port *port = NULL;
+	struct dp_netdev *dp = shash_find_data(&dp_netdevs, "ovs-netdev");
+	int error;
+
+	if (dp == NULL) {
+		return ODPP_NONE;
+	}
+
+	error = get_port_by_name(dp, devname, &port);
+	if (error !=0 ) {
+		return ODPP_NONE;
+	}
+	
+	return port->port_no;
 }
 
 /* Returns 'true' if there is a port with pmd netdev. */
@@ -2567,6 +2630,10 @@ dpif_netdev_flow_flush(struct dpif *dpif)
 {
     struct dp_netdev *dp = get_dp_netdev(dpif);
     struct dp_netdev_pmd_thread *pmd;
+
+#ifdef HAVE_XPF
+	xpf_hook_run_without_filter(hook_provider_ovs_flow, FLOW_HOOK_FLUSH_FLOW, NULL);
+#endif
 
     CMAP_FOR_EACH (pmd, node, &dp->poll_threads) {
         dp_netdev_pmd_flow_flush(pmd);
@@ -3233,6 +3300,7 @@ dp_netdev_flow_add(struct dp_netdev_pmd_thread *pmd,
     flow = xmalloc(sizeof *flow - sizeof flow->cr.flow.mf + mask.len);
     memset(&flow->stats, 0, sizeof flow->stats);
     flow->dead = false;
+	flow->offloadable = true;
     flow->batch = NULL;
     flow->mark = INVALID_FLOW_MARK;
     *CONST_CAST(unsigned *, &flow->pmd_id) = pmd->core_id;
@@ -3333,6 +3401,14 @@ flow_put_on_pmd(struct dp_netdev_pmd_thread *pmd,
         if (put->flags & DPIF_FP_MODIFY) {
             struct dp_netdev_actions *new_actions;
             struct dp_netdev_actions *old_actions;
+#ifdef HAVE_XPF
+			struct dp_flow_hook_flow_del_arg hook_arg;
+
+			hook_arg.core_id = pmd->core_id;
+			hook_arg.flow_ufid = (void *)&netdev_flow->ufid;
+			hook_arg.flow = netdev_flow;
+			xpf_hook_run_without_filter(hook_provider_ovs_flow, FLOW_HOOK_DEL_FLOW, &hook_arg);
+#endif
 
             new_actions = dp_netdev_actions_create(put->actions,
                                                    put->actions_len);
@@ -3462,6 +3538,15 @@ flow_del_on_pmd(struct dp_netdev_pmd_thread *pmd,
     netdev_flow = dp_netdev_pmd_find_flow(pmd, del->ufid, del->key,
                                           del->key_len);
     if (netdev_flow) {
+#ifdef HAVE_XPF
+		struct dp_flow_hook_flow_del_arg hook_arg;
+
+		hook_arg.core_id = pmd->core_id;
+		hook_arg.flow_ufid = (void *)&netdev_flow->ufid;
+		hook_arg.flow = netdev_flow;
+		xpf_hook_run_without_filter(hook_provider_ovs_flow, FLOW_HOOK_DEL_FLOW, &hook_arg);
+#endif
+
         if (stats) {
             get_dpif_flow_stats(netdev_flow, stats);
         }
@@ -4173,6 +4258,11 @@ dp_netdev_pmd_flush_output_on_port(struct dp_netdev_pmd_thread *pmd,
     struct cycle_timer timer;
     uint64_t cycles;
     uint32_t tx_flush_interval;
+#ifdef HAVE_XPF
+	struct dp_pkt_hook_tx_pre_arg tx_pre_hook_arg;
+	struct dp_pkt_hook_tx_post_arg tx_post_hook_arg;
+#endif
+
 
     cycle_timer_start(&pmd->perf_stats, &timer);
 
@@ -4186,8 +4276,26 @@ dp_netdev_pmd_flush_output_on_port(struct dp_netdev_pmd_thread *pmd,
     output_cnt = dp_packet_batch_size(&p->output_pkts);
     ovs_assert(output_cnt > 0);
 
+#ifdef HAVE_XPF
+	tx_pre_hook_arg.pkt_batch = &p->output_pkts;
+	tx_pre_hook_arg.core_id = pmd->core_id;
+	tx_pre_hook_arg.in_port = p->port->port_no;
+	tx_pre_hook_arg.dp = pmd->dp;
+	tx_pre_hook_arg.pmd = pmd;
+	xpf_hook_run_without_filter(hook_provider_ovs_pkt, PKT_HOOK_TX_PRE, &tx_pre_hook_arg);
+#endif
+
     netdev_send(p->port->netdev, tx_qid, &p->output_pkts, dynamic_txqs);
     dp_packet_batch_init(&p->output_pkts);
+
+#ifdef HAVE_XPF
+	tx_post_hook_arg.pkt_batch = &p->output_pkts;
+	tx_post_hook_arg.core_id = pmd->core_id;
+	tx_post_hook_arg.in_port = p->port->port_no;
+	tx_post_hook_arg.dp = pmd->dp;
+	tx_post_hook_arg.pmd = pmd;
+	xpf_hook_run_without_filter(hook_provider_ovs_pkt, PKT_HOOK_TX_POST, &tx_post_hook_arg);
+#endif
 
     /* Update time of the next flush. */
     atomic_read_relaxed(&pmd->dp->tx_flush_interval, &tx_flush_interval);
@@ -4244,6 +4352,10 @@ dp_netdev_process_rxq_port(struct dp_netdev_pmd_thread *pmd,
     int batch_cnt = 0;
     int rem_qlen = 0, *qlen_p = NULL;
     uint64_t cycles;
+#ifdef HAVE_XPF
+	struct dp_pkt_hook_rx_post_arg hook_arg;
+	struct dp_pkt_hook_rx_pre_arg rx_pre_arg;
+#endif
 
     /* Measure duration for polling and processing rx burst. */
     cycle_timer_start(&pmd->perf_stats, &timer);
@@ -4255,6 +4367,15 @@ dp_netdev_process_rxq_port(struct dp_netdev_pmd_thread *pmd,
     if (pmd_perf_metrics_enabled(pmd) && rxq->is_vhost) {
         qlen_p = &rem_qlen;
     }
+
+#ifdef HAVE_XPF
+	rx_pre_arg.pkt_batch = NULL;
+	rx_pre_arg.core_id = pmd->core_id;
+	rx_pre_arg.in_port = port_no;
+	rx_pre_arg.dp = pmd->dp;
+	rx_pre_arg.pmd = pmd;
+	xpf_hook_run_without_filter(hook_provider_ovs_pkt, PKT_HOOK_RX_PRE, &rx_pre_arg);
+#endif
 
     error = netdev_rxq_recv(rxq->rx, &batch, qlen_p);
     if (!error) {
@@ -4274,6 +4395,16 @@ dp_netdev_process_rxq_port(struct dp_netdev_pmd_thread *pmd,
                 }
             }
         }
+
+#ifdef HAVE_XPF
+		hook_arg.pkt_batch = &batch;
+		hook_arg.core_id = pmd->core_id;
+		hook_arg.in_port = port_no;
+		hook_arg.dp = pmd->dp;
+		hook_arg.pmd = pmd;
+		xpf_hook_run_without_filter(hook_provider_ovs_pkt, PKT_HOOK_RX_POST, &hook_arg);
+#endif
+
         /* Process packet batch. */
         dp_netdev_input(pmd, &batch, port_no);
 
@@ -4857,7 +4988,15 @@ reconfigure_datapath(struct dp_netdev *dp)
             seq_change(dp->port_seq);
             port_destroy(port);
         } else {
+#ifdef HAVE_XPF
+			if (netdev_is_hwoff(port->netdev)) {
+				port->dynamic_txqs = false;
+			} else {
+				port->dynamic_txqs = netdev_n_txq(port->netdev) < wanted_txqs;
+			}
+#else
             port->dynamic_txqs = netdev_n_txq(port->netdev) < wanted_txqs;
+#endif
         }
     }
 
@@ -6313,12 +6452,25 @@ packet_batch_per_flow_execute(struct packet_batch_per_flow *batch,
 {
     struct dp_netdev_actions *actions;
     struct dp_netdev_flow *flow = batch->flow;
+#ifdef HAVE_XPF
+	struct dp_pkt_hook_fwd_arg hook_arg;
+#endif
 
     dp_netdev_flow_used(flow, batch->array.count, batch->byte_count,
                         batch->tcp_flags, pmd->ctx.now / 1000);
 
     actions = dp_netdev_flow_get_actions(flow);
-
+#ifdef HAVE_XPF
+	hook_arg.pkt_batch = &batch->array;
+	hook_arg.actions = actions->actions;
+	hook_arg.actions_size = actions->size;
+	hook_arg.core_id = pmd->core_id;
+	hook_arg.flow_ufid = &flow->ufid;
+	hook_arg.dp = pmd->dp;
+	hook_arg.flow = flow;
+	xpf_hook_run_without_filter(hook_provider_ovs_pkt, PKT_HOOK_FWD, &hook_arg);
+#endif
+	
     dp_netdev_execute_actions(pmd, &batch->array, true, &flow->flow,
                               actions->actions, actions->size);
 }
@@ -6812,12 +6964,12 @@ dp_netdev_input__(struct dp_netdev_pmd_thread *pmd,
 
     /* All the flow batches need to be reset before any call to
      * packet_batch_per_flow_execute() as it could potentially trigger
-     * recirculation. When a packet matching flow ‘j’ happens to be
+     * recirculation. When a packet matching flow 'j' happens to be
      * recirculated, the nested call to dp_netdev_input__() could potentially
      * classify the packet as matching another flow - say 'k'. It could happen
      * that in the previous call to dp_netdev_input__() that same flow 'k' had
      * already its own batches[k] still waiting to be served.  So if its
-     * ‘batch’ member is not reset, the recirculated packet would be wrongly
+     * 'batch' member is not reset, the recirculated packet would be wrongly
      * appended to batches[k] of the 1st call to dp_netdev_input__(). */
     for (i = 0; i < n_batches; i++) {
         batches[i].flow->batch = NULL;
@@ -7014,6 +7166,14 @@ dp_execute_cb(void *aux_, struct dp_packet_batch *packets_,
         if (OVS_LIKELY(p)) {
             struct dp_packet *packet;
             struct dp_packet_batch out;
+#ifdef HAVE_XPF
+			struct dp_pkt_hook_fwd_post_arg hook_arg;
+
+			hook_arg.pkt_batch = packets_;
+			hook_arg.core_id = pmd->core_id;
+			hook_arg.dp = pmd->dp;
+			xpf_hook_run_without_filter(hook_provider_ovs_pkt, PKT_HOOK_FWD_POST, &hook_arg);
+#endif
 
             if (!should_steal) {
                 dp_packet_batch_clone(&out, packets_);
@@ -7392,11 +7552,32 @@ dpif_netdev_ct_flush(struct dpif *dpif, const uint16_t *zone,
                      const struct ct_dpif_tuple *tuple)
 {
     struct dp_netdev *dp = get_dp_netdev(dpif);
+	int ret = 0;
+#ifdef HAVE_XPF
+	struct dp_flow_hook_ct_flush_arg hook_arg;
+
+	hook_arg.zone = (uint16_t *)zone;
+	if (tuple != NULL) {
+		hook_arg.sip = (uint8_t *)&tuple->src;
+		hook_arg.dip = (uint8_t *)&tuple->dst;
+	} else {
+		hook_arg.sip = NULL;
+		hook_arg.dip = NULL;
+	}
+	xpf_hook_run_without_filter(hook_provider_ovs_flow, FLOW_HOOK_FLUSH_CT_PREV, &hook_arg);
+#endif
 
     if (tuple) {
-        return conntrack_flush_tuple(dp->conntrack, tuple, zone ? *zone : 0);
-    }
-    return conntrack_flush(dp->conntrack, zone);
+#ifdef HAVE_XPF
+        ret = conntrack_flush_tuple(dp->conntrack, tuple, zone ? *zone : 0);
+    } else {
+#endif
+		ret = conntrack_flush(dp->conntrack, zone);
+	}
+#ifdef HAVE_XPF
+	xpf_hook_run_without_filter(hook_provider_ovs_flow, FLOW_HOOK_FLUSH_CT_POST, &hook_arg);
+#endif
+    return ret;
 }
 
 static int
@@ -7982,3 +8163,218 @@ dpcls_lookup(struct dpcls *cls, const struct netdev_flow_key *keys[],
     }
     return false;
 }
+
+#ifdef HAVE_XPF
+static void
+dp_netdev_sync_flow_stats_by_ufid(void *dp, unsigned core_id, ovs_u128 *ufid,
+								  int cnt, int size, uint16_t tcp_flags, long long now)
+{
+	struct dp_netdev_pmd_thread *pmd;
+	struct dp_netdev_flow *netdev_flow;
+	long long last_used;
+
+	pmd = dp_netdev_get_pmd(dp, core_id);
+	if (pmd == NULL) {
+		return;
+	}
+
+	netdev_flow = dp_netdev_pmd_find_flow(pmd, ufid, NULL, 0);
+	if (netdev_flow == NULL) {
+		dp_netdev_pmd_unref(pmd);
+		return;
+	}
+
+	atomic_read_relaxed(&netdev_flow->stats.used, &last_used);
+	if (now > last_used) {
+		last_used = now;
+	}
+
+	dp_netdev_flow_used(netdev_flow, cnt, size, tcp_flags, last_used);
+	dp_netdev_pmd_unref(pmd);
+}
+
+static void dp_netdev_set_flow_offload(void *flow, bool value)
+{
+	if (flow == NULL) {
+		return;
+	}
+
+	((struct dp_netdev_flow *)flow)->offloadable = value;
+}
+
+static bool dp_netdev_flow_is_able_to_offload(void *flow, void *dp, unsigned core_id, ovs_u128 *ufid)
+{
+	struct dp_netdev_flow *netdev_flow = flow;
+	struct dp_netdev_pmd_thread *pmd = NULL;
+
+	if (netdev_flow != NULL ) {
+		return !netdev_flow->dead && netdev_flow->offloadable;
+	}
+
+	if (dp == NULL || ufid == NULL) {
+		return false;
+	}
+
+	pmd = dp_netdev_get_pmd(dp, core_id);
+	if (pmd == NULL) {
+		return false;
+	}
+
+	netdev_flow = dp_netdev_pmd_find_flow(pmd, ufid, NULL, 0);
+	if (netdev_flow == NULL) {
+		dp_netdev_pmd_unref(pmd);
+		return false;
+	}
+	
+	if (!netdev_flow->offloadable || netdev_flow->dead) {
+		dp_netdev_pmd_unref(pmd);
+		return false;
+	}
+
+	dp_netdev_pmd_unref(pmd);
+	return true;
+}
+
+static void ife_io_agent_tx_cb(void *pmd, void *pkt_batch, uint32_t output_port)
+{
+	struct dp_netdev_pmd_thread *pmd_ = pmd;
+	struct dp_packet_batch *packets_ = pkt_batch;
+	struct tx_port *p;
+
+	p = pmd_send_port_cache_lookup(pmd_, output_port);
+	if (OVS_LIKELY(p)) {
+		struct dp_packet *packet;
+
+		if (dp_packet_batch_size(&p->output_pkts)
+			+ dp_packet_batch_size(packets_) > NETDEV_MAX_BURST) {
+			/* Flush here to avoid overflow */
+			dp_netdev_pmd_flush_output_on_port(pmd_, p);
+		}
+
+		if (dp_packet_batch_is_empty(&p->output_pkts)) {
+			pmd_->n_output_batches++;
+		}
+
+		DP_PACKET_BATCH_FOR_EACH (i, packet, packets_) {
+			p->output_pkts_rxqs[dp_packet_batch_size(&p->output_pkts)] = 
+														pmd_->ctx.last_rxq;
+			dp_packet_batch_add(&p->output_pkts, packet);
+		}
+		return;
+	}
+
+	dp_packet_delete_batch(packets_, true);
+}
+
+static int dp_netdev_public(struct xpf_component *comp OVS_UNUSED, struct xpf_component_arg *arg)
+{
+	int ret = 0;
+
+	if (arg->version != XPF_COMPONENT_DP_NETDEV_ARG_VERSION) {
+		return -1;
+	}
+
+	switch (arg->op) {
+		case COM_DP_NETDEV_OP_SYNC_FLOW_STATS: {
+			struct com_dp_netdev_sync_stats_arg *xarg = (struct com_dp_netdev_sync_stats_arg *)arg;
+			dp_netdev_sync_flow_stats_by_ufid(xarg->in.dp, xarg->in.core_id, xarg->in.ufid, xarg->in.cnt,
+											  xarg->in.size, xarg->in.tcp_flags, xarg->in.now);
+			break;							   
+		}
+		case COM_DP_NETDEV_OP_ENABLE_FLOW_OFFLOAD:
+		case COM_DP_NETDEV_OP_DISABLE_FLOW_OFFLOAD: {
+			struct com_dp_netdev_set_offload_arg *xarg = (struct com_dp_netdev_set_offload_arg *)arg;
+			dp_netdev_set_flow_offload(xarg->in.flow, xarg->in.value);
+			break;
+		}
+		case COM_DP_NETDEV_OP_CHECK_FLOW_OFFLOAD: {
+			struct com_dp_netdev_check_offload_arg *xarg = (struct com_dp_netdev_check_offload_arg *)arg;
+			xarg->out.ret = dp_netdev_flow_is_able_to_offload(xarg->in.flow, xarg->in.dp, xarg->in.core_id,
+															  xarg->in.ufid);
+			break;
+		}
+		case COM_DP_NETDEV_OP_LOOKUP_NETDEV: {
+			struct com_dp_netdev_get_netdev_arg *xarg = (struct com_dp_netdev_get_netdev_arg *)arg;
+			struct dp_netdev_port *port = dp_netdev_lookup_port(xarg->in.dp, xarg->in.port_no);
+
+			if (port == NULL) {
+				ret = -1;
+				break;
+			}
+
+			xarg->out.info->dev_name = port->netdev->name;
+			xarg->out.info->class_name = port->netdev->netdev_class->type;
+			xarg->out.info->class_id = (uint64_t)port->netdev->netdev_class;
+			if (netdev_vport_is_vport_class(port->netdev->netdev_class)) {
+				xarg->out.info->ifindex = 0;
+			} else {
+				xarg->out.info->ifindex = netdev_get_ifindex(port->netdev);
+			}
+			break;
+		}
+		case COM_DP_NETDEV_OP_GET_DP: {
+			struct com_dp_netdev_get_dp_arg *xarg = (struct com_dp_netdev_get_dp_arg *)arg;
+			struct dp_netdev *dp = shash_find_data(&dp_netdevs, xarg->in.name);
+			if (dp == NULL) {
+				ret = -1;
+			} else {
+				xarg->out.dp = dp;
+				ovs_refcount_ref(&dp->ref_cnt);
+			}
+			break;
+		}
+		case COM_DP_NETDEV_OP_PUT_DP: {
+			struct com_dp_netdev_put_dp_arg	*xarg = (struct com_dp_netdev_put_dp_arg *)arg;
+			dp_netdev_unref((struct dp_netdev *)xarg->in.dp);
+			break;
+		}
+		case COM_DP_NETDEV_OP_DP_TO_CT: {
+			struct com_dp_netdev_dp_to_ct_arg *xarg = (struct com_dp_netdev_dp_to_ct_arg *)arg;
+			xarg->out.ct = ((struct dp_netdev *)xarg->in.dp)->conntrack;
+			break;
+		}
+		case COM_DP_NETDEV_OP_GET_TX_CB: {
+			struct com_dp_netdev_get_tx_cb_arg *xarg = (struct com_dp_netdev_get_tx_cb_arg *)arg;
+			xarg->out.cb = ife_io_agent_tx_cb;
+			break;
+		}
+		case COM_DP_NETDEV_OP_GET_MP: {
+			struct com_dp_netdev_get_mp_arg *xarg = (struct com_dp_netdev_get_mp_arg *)arg;
+			struct rte_mempool *mp = dpdk_shared_mp_get();
+			if (mp == NULL) {
+				ret = -1;
+			} else {
+				xarg->out.mp = mp;
+			}
+			break;
+		}
+	}
+
+	return ret;
+}
+
+static struct xpf_component_class dp_netdev_mod = {
+	.name = "ovs-netdev",
+	.id = COM_OVS_NETDEV,
+	.provide_ops = dp_netdev_public,
+};
+
+extern void xpf_hook_init(void);
+
+
+void dpif_netdev_init_xpf(void)
+{
+
+	xpf_hook_init();
+    xpf_component_init();
+
+	hook_provider_ovs_pkt = xpf_hook_provider_register(XPF_HOOK_PROVIDER_OVS_NETDEV_PKT);
+	hook_provider_ovs_flow = xpf_hook_provider_register(XPF_HOOK_PROVIDER_OVS_NETDEV_FLOW);
+
+	if (xpf_component_register(&dp_netdev_mod)) {
+		VLOG_ERR("Failed to register ovs-netdev component.");
+	}
+
+	VLOG_INFO("Register xpf component ovs-netdev success.");
+}
+#endif

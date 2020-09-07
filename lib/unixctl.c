@@ -126,6 +126,14 @@ unixctl_command_register(const char *name, const char *usage,
     shash_add(&commands, name, command);
 }
 
+void
+unixctl_command_unregister(const char *name)
+{
+	void *data = shash_find_and_delete(&commands, name);
+	free(data);
+	data = NULL;
+}
+
 static void
 unixctl_command_reply__(struct unixctl_conn *conn,
                         bool success, const char *body)

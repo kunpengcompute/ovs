@@ -1297,3 +1297,17 @@ AC_DEFUN([OVS_CHECK_LINUX_HOST],
         [ovs_cv_linux=true],
         [ovs_cv_linux=false])])
    AM_CONDITIONAL([LINUX], [$ovs_cv_linux])])
+
+dnl OVS_CHECK_XPF
+dnl
+dnl Check whether we're building with xpf.
+AC_DEFUN([OVS_CHECK_XPF],
+	[AC_ARG_ENABLE(
+		[xpf],
+		[AC_HELP_STRING([--enable-xpf], [Enable OVS XPF support])],
+		[], [enable_xpf=no])
+	if test "x$enable_xpf" = xyes; then
+	    AC_DEFINE([HAVE_XPF],[1],[ovs enable xpf])
+	fi
+    AM_CONDITIONAL([HAVE_XPF],[test $enable_xpf = yes])
+	])

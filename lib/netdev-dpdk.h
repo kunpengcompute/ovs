@@ -20,6 +20,7 @@
 #include <config.h>
 
 #include "openvswitch/compiler.h"
+#include "rte_mempool.h"
 
 struct dp_packet;
 struct netdev;
@@ -47,6 +48,9 @@ netdev_dpdk_rte_flow_create(struct netdev *netdev,
                             const struct rte_flow_item *items,
                             const struct rte_flow_action *actions,
                             struct rte_flow_error *error);
+int dpdk_shared_mp_init(void);
+void dpdk_shared_mp_uninit(void);
+struct rte_mempool *dpdk_shared_mp_get(void);
 
 #else
 

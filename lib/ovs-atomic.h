@@ -329,10 +329,10 @@
         #include "ovs-atomic-c++.h"
     #elif HAVE_STDATOMIC_H && !defined(__cplusplus)
         #include "ovs-atomic-c11.h"
-    #elif __GNUC__ >= 5 && !defined(__cplusplus)
-        #error "GCC 5+ should have <stdatomic.h>"
     #elif __GNUC__ >= 5 || (__GNUC__ >= 4 && __GNUC_MINOR__ >= 7)
         #include "ovs-atomic-gcc4.7+.h"
+	#elif __GNUC__ >= 5 || !defined(__cplusplus)
+		#error "GCC 5+ should have <stdatomic.h>"
     #elif __GNUC__ && defined(__x86_64__)
         #include "ovs-atomic-x86_64.h"
     #elif __GNUC__ && defined(__i386__)

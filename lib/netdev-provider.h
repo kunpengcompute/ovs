@@ -113,6 +113,8 @@ void netdev_get_devices(const struct netdev_class *,
                         struct shash *device_list);
 struct netdev **netdev_get_vports(size_t *size);
 
+void netdev_get_devices_by_type(const char *type, struct shash *device_list);
+
 /* A data structure for capturing packets received by a network device.
  *
  * Network device implementations may read these members but should not modify

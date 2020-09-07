@@ -39,6 +39,16 @@
 #include "openvswitch/poll-loop.h"
 #include "random.h"
 #include "timeval.h"
+#include "dpif-netdev.h"
+
+
+#if HAVE_XPF
+#include <xpf_config.h>
+#include <xpf_component.h>
+#include <xpf_component_arg.h>
+#include <xpf_hook.h>
+#include <xpf_hook_arg.h>
+#endif
 
 VLOG_DEFINE_THIS_MODULE(conntrack);
 
@@ -76,6 +86,11 @@ enum ct_alg_ctl_type {
     CT_ALG_CTL_SIP,
 };
 
+#if HAVE_XPF
+static bool
+update_offloaded_conn_expiration(struct conntrack *ct,
+			                     struct conn *conn, long long now);
+#endif
 static bool conn_key_extract(struct conntrack *, struct dp_packet *,
                              ovs_be16 dl_type, struct conn_lookup_ctx *,
                              uint16_t zone);
@@ -175,6 +190,15 @@ long long ct_timeout_val[] = {
     CT_TIMEOUTS
 #undef CT_TIMEOUT
 };
+
+#if HAVE_XPF
+static int conn_public(struct xpf_component *comp, struct xpf_component_arg *arg);
+static struct xpf_component_class conn_mod = {
+    .name = "ovs-ct",
+	.id = COM_OVS_CT,
+	.provide_ops = conn_public,
+};
+#endif
 
 /* The maximum TCP or UDP port number. */
 #define CT_MAX_L4_PORT 65535
@@ -313,6 +337,10 @@ conntrack_init(void)
     latch_init(&ct->clean_thread_exit);
     ct->clean_thread = ovs_thread_create("ct_clean", clean_thread_main, ct);
     ct->ipf = ipf_init();
+
+#if HAVE_XPF
+	xpf_component_register(&conn_mod);
+#endif
 
     return ct;
 }
@@ -907,6 +935,9 @@ conn_not_found(struct conntrack *ct, struct dp_packet *pkt,
         nc->nat_conn = nat_conn;
         ovs_mutex_init_adaptive(&nc->lock);
         nc->conn_type = CT_CONN_TYPE_DEFAULT;
+#if HAVE_XPF
+		nc->offload.seq = ++ct->seq;
+#endif
         cmap_insert(&ct->conns, &nc->cm_node, ctx->hash);
         atomic_count_inc(&ct->n_conn);
         ctx->conn = nc; /* For completeness. */
@@ -1298,6 +1329,12 @@ ct_sweep(struct conntrack *ct, long long now, size_t limit)
                 break;
             } else {
                 ovs_mutex_unlock(&conn->lock);
+#if HAVE_XPF
+				if (!update_offloaded_conn_expiration(ct, conn, now)) {
+				    /* Not expired yet */
+					continue;
+				}
+#endif
                 conn_clean(ct, conn);
             }
             count++;
@@ -2152,6 +2189,13 @@ new_conn(struct conntrack *ct, struct dp_packet *pkt, struct conn_key *key,
 static void
 delete_conn_cmn(struct conn *conn)
 {
+#if HAVE_XPF
+	struct ct_hook_del_arg hook_arg;
+	hook_arg.seq = conn->offload.seq;
+	hook_arg.original_hw_ufid = conn->offload.hw_ufid[CT_DIR_ORIGIN];
+	hook_arg.reply_hw_ufid = conn->offload.hw_ufid[CT_DIR_REPLY];
+	xpf_hook_run_without_filter(get_hook_ovs_flow(), FLOW_HOOK_DEL_CT, &hook_arg);
+#endif
     free(conn->nat_info);
     free(conn->alg);
     free(conn);
@@ -3075,3 +3119,176 @@ handle_tftp_ctl(struct conntrack *ct,
                        conn_for_expectation,
                        !!(pkt->md.ct_state & CS_REPLY_DIR), false, false);
 }
+
+#if HAVE_XPF
+/**
+ * Update expiration time of connection.
+ * return true if expired after updating.
+ * 
+ * Warning: ctb lock must be taken before calling this function
+ * */
+static bool
+update_offloaded_conn_expiration(struct conntrack *ct,
+			                     struct conn *conn, long long now)
+{
+	struct ct_l4_proto *proto_ops = l4_protos[conn->key.nw_proto];
+	bool expired = false;
+
+	if (!proto_ops || !proto_ops->conn_state_sync) {
+	    return true;
+	}
+
+	for (int dir = 0; dir < CT_DIR_MAX; dir++) {
+	    struct com_flow_agent_update_ct_age_arg arg;
+
+		if (!conn->offload.hw_ufid[dir]) {
+		    continue;
+		}
+
+		arg.base.op = COM_FLOW_AGENT_UPDATE_CT_AGE;
+		arg.base.version = XPF_COMPONENT_FLOW_AGENT_ARG_VERSION;
+		arg.in.hw_ufid = conn->offload.hw_ufid[dir];
+		arg.out.hw_last_used = 0;
+		xpf_component_call(COM_XPF_FLOW_AGENT, &arg.base);
+		if (arg.out.hw_last_used == 0) {
+		    continue;
+		}
+		ovs_mutex_unlock(&ct->ct_lock);
+		ovs_mutex_lock(&conn->lock);
+		proto_ops->conn_state_sync(ct, conn, dir, arg.out.hw_last_used);
+		ovs_mutex_unlock(&conn->lock);
+		ovs_mutex_lock(&ct->ct_lock);
+	}
+
+	if ((conn->conn_type == CT_CONN_TYPE_DEFAULT) && 
+		 (now >= conn->expiration)) {
+	    expired = true;
+	}
+
+	return expired;
+}
+
+static int
+conn_update_offload_state(struct conntrack *ct, ovs_be16 ether_type, union ct_addr *sip, union ct_addr *dip,
+			              ovs_be16 sport, ovs_be16 dport, uint8_t proto,
+						  uint16_t zone, uint64_t hw_ufid, const void *proto_state,
+						  long long hw_last_used)
+{
+	struct conn *conn = NULL;
+	long long now = time_msec();
+	struct conn_key key;
+	bool reply = false;
+
+	/* Construct key */
+	memset(&key, 0, sizeof(key));
+	key.zone = zone;
+	key.dl_type = ether_type;
+	key.src.addr = *sip;
+	key.dst.addr = *dip;
+	key.nw_proto = proto;
+	if (proto == IPPROTO_ICMP) {
+	    uint8_t icmp_type = ((uint8_t *)&sport)[1];
+		if ((icmp_type == ICMP4_ECHO_REQUEST) || 
+			(icmp_type == ICMP4_ECHO_REPLY)) {
+		    key.src.icmp_id = key.dst.icmp_id = dport;
+			key.src.icmp_type = icmp_type;
+			key.dst.icmp_type = reverse_icmp_type(icmp_type);
+		} else {
+		    VLOG_WARN("unspported icmp type: %d", icmp_type);
+		}
+	} else if (proto == IPPROTO_ICMPV6) {
+	    uint8_t icmp6_type = ((uint8_t *)&sport)[1];
+		if ((icmp6_type == ICMP6_ECHO_REQUEST) || 
+			(icmp6_type == ICMP6_ECHO_REPLY)) {
+		    key.src.icmp_id = key.dst.icmp_id = dport;
+			key.src.icmp_type = icmp6_type;
+			key.dst.icmp_type = reverse_icmp6_type(icmp6_type);
+		} else {
+		    VLOG_WARN("unsupported icmp type: %d", icmp6_type);
+		}
+	} else {
+	   key.src.port = sport;
+	   key.dst.port = dport;
+	}
+
+	if (!conn_lookup(ct, &key, now, &conn, &reply)) {
+	    return 0;
+	}
+
+	if (conn->conn_type == CT_CONN_TYPE_UN_NAT) {
+	    struct conn *rev_conn = conn;
+
+		reply = true;
+		if (!conn_lookup(ct, &rev_conn->rev_key, now, &conn, &reply)) {
+		    return 0;
+		}
+	}
+
+	/**
+	 * When hw ufid is not zero, proto_state is used as connection sequence list.
+	 * The first element decleares the length of list.
+	 */
+	if (hw_ufid && proto_state) {
+	    uint64_t num = ((uint64_t *)proto_state)[0];
+		int idx, end_idx = num + 1;
+
+		/**
+		 * Cancel offloading if connection sequence changed after offloading,
+		 * which means connection is possibly destroyed and created agin.
+		 */
+		for (idx = 1; idx < end_idx; idx++) {
+		    if (conn->offload.seq == ((uint64_t *)proto_state)[idx]) {
+			    break;
+			}
+		}
+		if (idx == end_idx) {
+		    return -1;
+		}
+	}
+
+	/* Update expiration only when connection is not offloaded */
+	if (!hw_ufid && l4_protos[proto] && l4_protos[proto]->conn_state_sync) {
+	    ovs_mutex_lock(&conn->lock);
+		l4_protos[proto]->conn_state_sync(ct, conn, reply, hw_last_used);
+		ovs_mutex_unlock(&conn->lock);
+	}
+
+	conn->offload.hw_ufid[reply] = hw_ufid;
+	return 0;
+}
+
+static int conn_public(struct xpf_component *comp OVS_UNUSED, struct xpf_component_arg *arg)
+{
+	int ret = 0;
+
+	if (arg->version != XPF_COMPONENT_CT_ARG_VERSION) {
+	    return -1;
+	}
+
+	switch (arg->op) {
+	    case COM_CT_UPDATE_OFFLOAD_STATE: {
+		    struct com_ct_update_offload_state_arg *xarg = (struct com_ct_update_offload_state_arg *)arg;
+			xarg->out.ret = conn_update_offload_state(xarg->in.ct, xarg->in.ether_type,
+						                              (union ct_addr *)xarg->in.sip, (union ct_addr *)xarg->in.dip,
+													  xarg->in.sport, xarg->in.dport, xarg->in.proto, xarg->in.zone,
+													  xarg->in.hw_ufid, xarg->in.proto_state, xarg->in.hw_last_used);
+			break;
+		}
+      case COM_CT_FLUSH: {
+		struct com_ct_flush_arg *xarg = (struct com_ct_flush_arg *)arg;
+        if (xarg->in.sip == NULL && xarg->in.dip == NULL) {
+		    conntrack_flush(xarg->in.ct, xarg->in.zone);
+		} else {
+		    /* TBD: conntrack_flush_tuple() */
+		}
+		break;
+	   }
+	  case COM_CT_ENABLE_OFFLOAD: {
+	       struct com_ct_enable_offload_arg *xarg = (struct com_ct_enable_offload_arg *)arg;
+		   ((struct conntrack *)xarg->in.ct)->offload_is_on = xarg->in.enable;
+		   break;
+		}
+	}
+	return ret;
+}
+#endif

@@ -66,6 +66,9 @@
 #include "unixctl.h"
 #include "util.h"
 #include "uuid.h"
+#ifdef HAVE_XPF
+#include "xpf_config.h"
+#endif
 
 enum {VIRTIO_RXQ, VIRTIO_TXQ, VIRTIO_QNUM};
 
@@ -83,12 +86,12 @@ static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 20);
  * The minimum mbuf size is limited to avoid scatter behaviour and drop in
  * performance for standard Ethernet MTU.
  */
-#define ETHER_HDR_MAX_LEN           (ETHER_HDR_LEN + ETHER_CRC_LEN \
+#define ETHER_HDR_MAX_LEN           (RTE_ETHER_HDR_LEN + RTE_ETHER_CRC_LEN \
                                      + (2 * VLAN_HEADER_LEN))
-#define MTU_TO_FRAME_LEN(mtu)       ((mtu) + ETHER_HDR_LEN + ETHER_CRC_LEN)
+#define MTU_TO_FRAME_LEN(mtu)       ((mtu) + RTE_ETHER_HDR_LEN + RTE_ETHER_CRC_LEN)
 #define MTU_TO_MAX_FRAME_LEN(mtu)   ((mtu) + ETHER_HDR_MAX_LEN)
 #define FRAME_LEN_TO_MTU(frame_len) ((frame_len)                    \
-                                     - ETHER_HDR_LEN - ETHER_CRC_LEN)
+                                     - RTE_ETHER_HDR_LEN - RTE_ETHER_CRC_LEN)
 #define NETDEV_DPDK_MBUF_ALIGN      1024
 #define NETDEV_DPDK_MAX_PKT_LEN     9728
 
@@ -189,6 +192,9 @@ static const struct rte_eth_conf port_conf = {
         .mq_mode = ETH_MQ_TX_NONE,
     },
 };
+
+/* shared mempool define */
+static struct dpdk_mp *g_dpdk_shared_mp = NULL;
 
 /*
  * These callbacks allow virtio-net devices to be added to vhost ports when
@@ -615,7 +621,7 @@ dpdk_calculate_mbufs(struct netdev_dpdk *dev, int mtu, bool per_port_mp)
          * can change dynamically at runtime. For now, use this rough
          * heurisitic.
          */
-        if (mtu >= ETHER_MTU) {
+        if (mtu >= RTE_ETHER_MTU) {
             n_mbufs = MAX_NB_MBUF;
         } else {
             n_mbufs = MIN_NB_MBUF;
@@ -770,7 +776,6 @@ dpdk_mp_get(struct netdev_dpdk *dev, int mtu, bool per_port_mp)
     }
     /* Sweep mempools after reuse or before create. */
     dpdk_mp_sweep();
-
     if (!reuse) {
         dmp = dpdk_mp_create(dev, mtu, per_port_mp);
         if (dmp) {
@@ -801,9 +806,46 @@ dpdk_mp_get(struct netdev_dpdk *dev, int mtu, bool per_port_mp)
     return dmp;
 }
 
+int dpdk_shared_mp_init(void)
+{
+	struct netdev_dpdk dev;
+	uint32_t buf_size;
+	bool per_port_mp = false;
+	struct dpdk_mp *dmp = NULL;
+
+	dev.up.name = "dummy_netdev_dpdk";
+#ifdef HAVE_XPF
+	dev.requested_mtu = ETH_EVS_MTU;
+#else
+	dev.requested_mtu = RTE_ETHER_MTU;
+#endif
+	dev.requested_socket_id = rte_lcore_to_socket_id(rte_get_master_lcore());
+	buf_size = dpdk_buf_size(dev.requested_mtu);
+	dmp = dpdk_mp_get(&dev, FRAME_LEN_TO_MTU(buf_size), per_port_mp);
+	if (dmp == NULL) {
+		VLOG_ERR("DPDK shared memory pool initiation is failed!");
+		return -1;
+	}
+
+	VLOG_INFO("Created shared memory %s at socket %d, mtu %u, buf_size %u",
+		dmp->mp->name, dev.requested_socket_id, dev.requested_mtu, buf_size);
+
+	g_dpdk_shared_mp = dmp;
+
+	return 0;
+}
+
+struct rte_mempool *dpdk_shared_mp_get(void)
+{
+	if (g_dpdk_shared_mp == NULL) {
+		VLOG_ERR("DPDK shared rte_memory pool for netdev is NULL");
+		return NULL;
+	}
+	return g_dpdk_shared_mp->mp;
+}
+
 /* Decrement reference to a mempool. */
-static void
-dpdk_mp_put(struct dpdk_mp *dmp)
+static void dpdk_mp_put(struct dpdk_mp *dmp)
 {
     if (!dmp) {
         return;
@@ -813,6 +855,21 @@ dpdk_mp_put(struct dpdk_mp *dmp)
     ovs_assert(dmp->refcount);
     dmp->refcount--;
     ovs_mutex_unlock(&dpdk_mp_mutex);
+}
+
+void dpdk_shared_mp_uninit(void)
+{
+	if (g_dpdk_shared_mp == NULL) {
+		return;
+	}
+	dpdk_mp_put(g_dpdk_shared_mp);
+	ovs_mutex_lock(&dpdk_mp_mutex);
+	if (!g_dpdk_shared_mp->refcount && dpdk_mp_full(g_dpdk_shared_mp->mp)) {
+		VLOG_INFO("Deleting shared memory pool %s", g_dpdk_shared_mp->mp->name);
+	}
+	dpdk_mp_sweep();
+	ovs_mutex_unlock(&dpdk_mp_mutex);
+	g_dpdk_shared_mp = NULL;
 }
 
 /* Depending on the memory model being used this function tries to
@@ -930,7 +987,7 @@ dpdk_eth_dev_port_config(struct netdev_dpdk *dev, int n_rxq, int n_txq)
      * scatter to support jumbo RX.
      * Setting scatter for the device is done after checking for
      * scatter support in the device capabilites. */
-    if (dev->mtu > ETHER_MTU) {
+    if (dev->mtu > RTE_ETHER_MTU) {
         if (dev->hw_ol_features & NETDEV_RX_HW_SCATTER) {
             conf.rxmode.offloads |= DEV_RX_OFFLOAD_SCATTER;
         }
@@ -1042,7 +1099,7 @@ dpdk_eth_dev_init(struct netdev_dpdk *dev)
 {
     struct rte_pktmbuf_pool_private *mbp_priv;
     struct rte_eth_dev_info info;
-    struct ether_addr eth_addr;
+    struct rte_ether_addr eth_addr;
     int diag;
     int n_rxq, n_txq;
     uint32_t rx_chksm_offload_capa = DEV_RX_OFFLOAD_UDP_CKSUM |
@@ -1167,7 +1224,7 @@ common_construct(struct netdev *netdev, dpdk_port_t port_no,
     dev->port_id = port_no;
     dev->type = type;
     dev->flags = 0;
-    dev->requested_mtu = ETHER_MTU;
+    dev->requested_mtu = RTE_ETHER_MTU;
     dev->max_packet_len = MTU_TO_FRAME_LEN(dev->mtu);
     dev->requested_lsc_interrupt_mode = 0;
     ovsrcu_index_init(&dev->vid, -1);
@@ -1694,7 +1751,7 @@ netdev_dpdk_get_port_by_mac(const char *mac_str)
     }
 
     RTE_ETH_FOREACH_DEV (port_id) {
-        struct ether_addr ea;
+        struct rte_ether_addr ea;
 
         rte_eth_macaddr_get(port_id, &ea);
         memcpy(port_mac.ea, ea.addr_bytes, ETH_ADDR_LEN);
@@ -2077,10 +2134,10 @@ netdev_dpdk_policer_pkt_handle(struct rte_meter_srtcm *meter,
                                struct rte_meter_srtcm_profile *profile,
                                struct rte_mbuf *pkt, uint64_t time)
 {
-    uint32_t pkt_len = rte_pktmbuf_pkt_len(pkt) - sizeof(struct ether_hdr);
+    uint32_t pkt_len = rte_pktmbuf_pkt_len(pkt) - sizeof(struct rte_ether_hdr);
 
     return rte_meter_srtcm_color_blind_check(meter, profile, time, pkt_len) ==
-                                             e_RTE_METER_GREEN;
+                                             RTE_COLOR_GREEN;
 }
 
 static int
@@ -2623,7 +2680,7 @@ netdev_dpdk_set_mtu(struct netdev *netdev, int mtu)
      * a method to retrieve the upper bound MTU for a given device.
      */
     if (MTU_TO_MAX_FRAME_LEN(mtu) > NETDEV_DPDK_MAX_PKT_LEN
-        || mtu < ETHER_MIN_MTU) {
+        || mtu < RTE_ETHER_MIN_MTU) {
         VLOG_WARN("%s: unsupported MTU %d\n", dev->up.name, mtu);
         return EINVAL;
     }
