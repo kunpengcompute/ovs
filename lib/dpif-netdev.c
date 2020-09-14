@@ -87,6 +87,7 @@
 #include <xpf_hook.h>
 #include <xpf_hook_arg.h>
 #include <hwoff_init.h>
+#include "mac-learning.h"
 #endif
 
 VLOG_DEFINE_THIS_MODULE(dpif_netdev);
@@ -3266,6 +3267,151 @@ dp_netdev_get_mega_ufid(const struct match *match, ovs_u128 *mega_ufid)
     dpif_flow_hash(NULL, &masked_flow, sizeof(struct flow), mega_ufid);
 }
 
+
+#ifdef HAVE_XPF
+static void dp_netdev_pmd_del_flow_with_smac_except_inport(struct dp_netdev_pmd_thread *pmd,
+														   struct eth_addr smac, uint32_t dp_in_port,
+														   bool is_same_pmd)
+{
+	struct dp_netdev_flow *netdev_flow = NULL;
+	struct dp_flow_hook_flow_del_arg hook_arg;
+
+	if (is_same_pmd != true) {
+		ovs_mutex_lock(&pmd->flow_mutex);
+	}
+
+	CMAP_FOR_EACH (netdev_flow, node, &pmd->flow_table) {
+		if (eth_addr_equals(netdev_flow->flow.dl_src, smac)
+			&& (netdev_flow->flow.in_port.odp_port != dp_in_port)
+			&& !eth_addr_is_broadcast(netdev_flow->flow.dl_dst)) {
+			hook_arg.core_id = pmd->core_id;
+			hook_arg.flow_ufid = (void *)&netdev_flow->ufid;
+			hook_arg.flow = netdev_flow;
+			xpf_hook_run_without_filter(hook_provider_ovs_flow, FLOW_HOOK_DEL_FLOW, &hook_arg);
+		}
+	}
+
+	if (is_same_pmd != true) {
+		ovs_mutex_unlock(&pmd->flow_mutex);
+	}
+}
+
+static bool is_clear_forward_flow_needed(struct dp_netdev_flow *netdev_flow,
+										 struct eth_addr *temp_mac, uint32_t *dp_in_port)
+{
+	struct migrate_rarp_mac_entry *e = NULL;
+	bool clear_flow = false;
+
+	ovs_rwlock_wrlock(&hwoff_rarp_record.rwlock);
+	if (unlikely(hwoff_rarp_record.cont)) {
+		e = rarp_mac_lookup(netdev_flow->flow.dl_src);
+		if (e && e->need_del_flow) {
+			rarp_mac_remove(e);
+			(void)memcpy(&temp_mac->ea, &netdev_flow->flow.dl_src.ea, ETH_ADDR_LEN);
+			*dp_in_port = netdev_flow->flow.in_port.odp_port;
+			clear_flow = true;
+		}
+	}
+	ovs_rwlock_unlock(&hwoff_rarp_record.rwlock);
+	
+	return clear_flow;
+}
+
+static void dp_netdev_pmd_del_flow_with_smac(struct dp_netdev_pmd_thread *pmd, struct eth_addr smac)
+{
+	struct dp_netdev_flow *netdev_flow = NULL;
+	struct dp_flow_hook_flow_del_arg hook_arg;
+
+	ovs_mutex_lock(&pmd->flow_mutex);
+	CMAP_FOR_EACH (netdev_flow, node, &pmd->flow_table) {
+		if (eth_addr_equals(netdev_flow->flow.dl_src, smac)
+			&& !eth_addr_is_broadcast(netdev_flow->flow.dl_dst)) {
+			hook_arg.core_id = pmd->core_id;
+			hook_arg.flow_ufid = (void *)&netdev_flow->ufid;
+			hook_arg.flow = netdev_flow;
+			xpf_hook_run_without_filter(hook_provider_ovs_flow, FLOW_HOOK_DEL_FLOW, &hook_arg);
+		}
+	}
+	ovs_mutex_unlock(&pmd->flow_mutex);
+}
+
+static void dp_netdev_clear_reverse_flow(struct dp_netdev *dp, struct eth_addr smac)
+{
+	struct dp_netdev_pmd_thread *pmd = NULL;
+	CMAP_FOR_EACH (pmd, node, &dp->poll_threads) {
+		dp_netdev_pmd_del_flow_with_smac(pmd, smac);
+	}
+}
+
+static bool is_clear_reverse_flow_needed(struct dp_netdev_flow *netdev_flow, struct eth_addr *temp_mac)
+{
+	struct migrate_rarp_mac_entry *e = NULL;
+	bool clear_reverse_flow = false;
+
+	ovs_rwlock_wrlock(&hwoff_rarp_record.rwlock);
+	if (unlikely(hwoff_rarp_record.count)) {
+		e = rarp_mac_lookup(netdev_flow->flow.dl_dst);
+		if (e && e->need_del_flow) {
+			rarp_mac_remove(e);
+			(void)memcpy(&temp_mac->ea, &netdev_flow->flow.dl_dst.ea, ETH_ADDR_LEN);
+			clear_reverse_flow = true;
+		}
+	}
+	ovs_rwlock_unlock(&hwoff_rarp_record.rwlock);
+	
+	return clear_reverse_flow;
+}
+
+static void process_clear_forward_flow(struct dp_netdev_pmd_thread *pmd, struct dp_netdev_flow *flow)
+{
+	uint32_t dp_in_port = 0;
+	struct eth_addr temp_mac;
+
+	(void)memset(&temp_mac, 0, sizeof(struct eth_addr));
+	if (rarp_record_enabled && is_clear_forward_flow_needed(flow, &temp_mac, &dp_in_port)) {
+		dp_netdev_clear_forward_flow(pmd, temp_mac, dp_in_port);
+	}
+}
+
+static void process_offload_del_flow(struct dp_netdev_pmd_thread *pmd, const struct dpif_flow_del *del)
+{
+	bool clear_reverse_flow = false;
+	struct eth_addr temp_mac;
+	struct dp_netdev_flow *netdev_flow = NULL;
+	struct dp_netdev_flow *temp_del_flow = NULL;
+	struct dp_flow_hook_flow_del_arg hook_arg;
+
+	(void)memset(&temp_mac, 0, sizeof(struct eth_addr));
+
+	ovs_mutex_lock(&pmd->flow_mutex);
+	netdev_flow = dp_netdev_pmd_find_flow(pmd, del->ufid, del->key, del->key_len);
+	if (netdev_flow == NULL) {
+		ovs_mutex_unlock(&pmd->flow_mutex);
+		return;
+	}
+	temp_del_flow = xcalloc(1, sizeof(struct dp_netdev_flow));
+	if (temp_del_flow == NULL) {
+		ovs_mutex_unlock(&pmd->flow_mutex);
+		return;
+	}
+	(void)memcpy(temp_del_flow, netdev_flow, sizeof(struct dp_netdev_flow));
+	ovs_mutex_unlock(&pmd->flow_mutex);
+
+	hook_arg.core_id = pmd->core_id;
+	hook_arg.flow_ufid = (void *)&temp_del_flow->ufid;
+	hook_arg.flow = temp_del_flow;
+	xpf_hook_run_without_filter(hook_provider_ovs_flow, FLOW_HOOK_DEL_FLOW, &hook_arg);
+
+	clear_reverse_flow = is_clear_reverse_flow_needed(temp_del_flow, &temp_mac);
+	if (unlikely(clear_reverse_flow)) {
+		dp_netdev_clear_reverse_flow(pmd->dp, temp_mac);
+	}
+	free(temp_del_flow);
+	return;
+}
+
+#endif
+
 static struct dp_netdev_flow *
 dp_netdev_flow_add(struct dp_netdev_pmd_thread *pmd,
                    struct match *match, const ovs_u128 *ufid,
@@ -3365,6 +3511,10 @@ dp_netdev_flow_add(struct dp_netdev_pmd_thread *pmd,
         ds_destroy(&ds);
     }
 
+#ifdef HAVE_XPF
+	process_clear_forward_flow(pmd, flow);
+#endif
+
     return flow;
 }
 
@@ -3378,6 +3528,13 @@ flow_put_on_pmd(struct dp_netdev_pmd_thread *pmd,
 {
     struct dp_netdev_flow *netdev_flow;
     int error = 0;
+
+#ifdef HAVE_XPF
+	bool clear_reverse_flow = false;
+	struct eth_addr temp_mac;
+
+	(void)memset(&temp_mac, 0, sizeof(struct eth_addr));
+#endif
 
     if (stats) {
         memset(stats, 0, sizeof *stats);
@@ -3408,6 +3565,7 @@ flow_put_on_pmd(struct dp_netdev_pmd_thread *pmd,
 			hook_arg.flow_ufid = (void *)&netdev_flow->ufid;
 			hook_arg.flow = netdev_flow;
 			xpf_hook_run_without_filter(hook_provider_ovs_flow, FLOW_HOOK_DEL_FLOW, &hook_arg);
+            clear_reverse_flow = is_clear_reverse_flow_needed(netdev_flow, &temp_mac);
 #endif
 
             new_actions = dp_netdev_actions_create(put->actions,
@@ -3444,6 +3602,13 @@ flow_put_on_pmd(struct dp_netdev_pmd_thread *pmd,
         }
     }
     ovs_mutex_unlock(&pmd->flow_mutex);
+
+#ifdef HAVE_XPF
+	if (unlikely(clear_reverse_flow)) {
+		dp_netdev_clear_reverse_flow(pmd->dp, temp_mac);
+	}
+#endif
+
     return error;
 }
 
@@ -3534,19 +3699,14 @@ flow_del_on_pmd(struct dp_netdev_pmd_thread *pmd,
     struct dp_netdev_flow *netdev_flow;
     int error = 0;
 
+#ifdef HAVE_XPF
+	process_offload_del_flow(pmd, del);
+#endif
+
     ovs_mutex_lock(&pmd->flow_mutex);
     netdev_flow = dp_netdev_pmd_find_flow(pmd, del->ufid, del->key,
                                           del->key_len);
     if (netdev_flow) {
-#ifdef HAVE_XPF
-		struct dp_flow_hook_flow_del_arg hook_arg;
-
-		hook_arg.core_id = pmd->core_id;
-		hook_arg.flow_ufid = (void *)&netdev_flow->ufid;
-		hook_arg.flow = netdev_flow;
-		xpf_hook_run_without_filter(hook_provider_ovs_flow, FLOW_HOOK_DEL_FLOW, &hook_arg);
-#endif
-
         if (stats) {
             get_dpif_flow_stats(netdev_flow, stats);
         }

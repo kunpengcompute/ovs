@@ -66,6 +66,7 @@
 #include "tunnel.h"
 #include "util.h"
 #include "uuid.h"
+#include "dpif-provider.h"
 
 COVERAGE_DEFINE(xlate_actions);
 COVERAGE_DEFINE(xlate_actions_oversize);
@@ -2567,6 +2568,37 @@ update_learning_table__(const struct xbridge *xbridge,
                                     in_xbundle->ofbundle));
 }
 
+#ifdef HAVE_XPF
+static bool is_reverse_arp(const struct flow *flow)
+{
+	if (flow->dl_type == htons(ETH_TYPE_RARP)) {
+		return true;
+	}
+
+	return false;
+}
+
+static void hwoff_update_learning_table(const struct xlate_ctx *ctx, struct xbundle *in_xbundle,
+										struct eth_addr dl_src, int vlan, bool is_grat_arp,
+										bool is_rarp, bool is_ipv6_nd)
+{
+	if (!update_learning_table__(ctx->xbridge, in_xbundle, dl_src, vlan,
+								 is_grat_arp)) {
+		xlate_report_debug(ctx, OFT_DETAIL, "learned that "ETH_ADDR_FMT" is "
+					       "on port %s in VLAN %d",
+						   ETH_ADDR_ARGS(dl_src), in_xbundle->name, vlan);
+		if (rarp_record_enabled
+			&& (!strcmp(ctx->xbridge->dpif->dpif_class->type, "netdev"))
+			&& (unlikely(is_rarp) || unlikely(is_grat_arp) || unlikely(is_ipv6_nd))) {
+			ovs_rwlock_wrlock(&hwoff_rarp_record.rwlock);
+			rarp_mac_insert(dl_src);
+			ovs_rwlock_unlock(&hwoff_rarp_record.rwlock);
+		}
+	}
+}
+
+#else
+
 static void
 update_learning_table(const struct xlate_ctx *ctx,
                       struct xbundle *in_xbundle, struct eth_addr dl_src,
@@ -2579,6 +2611,7 @@ update_learning_table(const struct xlate_ctx *ctx,
                            ETH_ADDR_ARGS(dl_src), in_xbundle->name, vlan);
     }
 }
+#endif
 
 /* Updates multicast snooping table 'ms' given that a packet matching 'flow'
  * was received on 'in_xbundle' in 'vlan' and is either Report or Query. */
@@ -2983,12 +3016,20 @@ xlate_normal(struct xlate_ctx *ctx)
 
     /* Learn source MAC. */
     bool is_grat_arp = is_gratuitous_arp(flow, wc);
+#ifdef HAVE_XPF
+	bool is_rarp = is_reverse_arp(flow);
+	bool is_ipv6_nd = is_nd(flow, NULL);
+#endif
     if (ctx->xin->allow_side_effects
         && flow->packet_type == htonl(PT_ETH)
         && in_port->pt_mode != NETDEV_PT_LEGACY_L3
     ) {
-        update_learning_table(ctx, in_xbundle, flow->dl_src, vlan,
-                              is_grat_arp);
+#ifdef HAVE_XPF
+		hwoff_update_learning_table(ctx, in_xbundle, flow->dl_src, vlan,
+									is_grat_arp, is_rarp, is_ipv6_nd);
+#else
+		update_learning_table(ctx, in_xbundle, flow->dl_src, vlan, is_grat_arp);
+#endif
     }
     if (ctx->xin->xcache && in_xbundle != &ofpp_none_bundle) {
         struct xc_entry *entry;

@@ -1378,6 +1378,9 @@ netdev_dpdk_vhost_construct(struct netdev *netdev)
     err = rte_vhost_driver_disable_features(dev->vhost_id,
                                 1ULL << VIRTIO_NET_F_HOST_TSO4
                                 | 1ULL << VIRTIO_NET_F_HOST_TSO6
+#ifdef HAVE_XPF
+								| 1ULL << VIRTIO_NET_F_GUEST_ANNOUNCE
+#endif
                                 | 1ULL << VIRTIO_NET_F_CSUM);
     if (err) {
         VLOG_ERR("rte_vhost_driver_disable_features failed for vhost user "
@@ -4386,6 +4389,9 @@ netdev_dpdk_vhost_client_reconfigure(struct netdev *netdev)
         err = rte_vhost_driver_disable_features(dev->vhost_id,
                                     1ULL << VIRTIO_NET_F_HOST_TSO4
                                     | 1ULL << VIRTIO_NET_F_HOST_TSO6
+#ifdef HAVE_XPF
+									| 1ULL << VIRTIO_NET_F_GUEST_ANNOUNCE
+#endif
                                     | 1ULL << VIRTIO_NET_F_CSUM);
         if (err) {
             VLOG_ERR("rte_vhost_driver_disable_features failed for vhost user "

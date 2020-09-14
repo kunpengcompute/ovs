@@ -35,6 +35,94 @@ COVERAGE_DEFINE(mac_learning_expired);
 COVERAGE_DEFINE(mac_learning_evicted);
 COVERAGE_DEFINE(mac_learning_moved);
 
+#ifdef HAVE_XPF
+struct migrate_rarp_macs hwoff_rarp_record;
+bool rarp_record_enabled = false;
+
+struct migrate_rarp_mac_entry *rarp_mac_lookup(struct eth_addr mac)
+{
+	struct migrate_rarp_mac_entry *e = NULL;
+
+	if (!rarp_record_enabled) {
+		return NULL;
+	}
+
+	HMAP_FOR_EACH_WITH_HASH (e, hmap_node, hash_mac(mac, 0, 0),
+							 &hwoff_rarp_record.table) {
+		if (eth_addr_equals(e->mac, mac)) {
+			break;
+		}
+	}
+
+	return e;
+}
+
+struct migrate_rarp_mac_entry *rarp_mac_insert(struct eth_addr mac)
+{
+	struct migrate_rarp_mac_entry *e = NULL;
+	uint32_t hash;
+
+	if (!rarp_record_enabled) {
+		return NULL;
+	}
+
+	if (hwoff_rarp_record.count >= MIGRATE_MAC_MAX) {
+		return NULL;
+	}
+
+	e = rarp_mac_lookup(mac);
+	if (!e) {
+		hash = hash_mac(mac, 0, 0);
+		e = xmalloc(sizeof(*e));
+		if (e == NULL) {
+			return NULL;
+		}
+
+		e->need_del_flow = true;
+		memcpy(&e->mac.ea, &mac.ea, ETH_ADDR_LEN);
+		hmap_insert(&hwoff_rarp_record.table, &e->hmap_node, hash);
+		hwoff_rarp_record.count++;
+	} else {
+		e->need_del_flow = true;
+	}
+
+	return e;
+}
+
+void rarp_mac_remove(struct migrate_rarp_mac_entry *e)
+{
+	if (!rarp_record_enabled) {
+		return;
+	}
+	hmap_remove(&hwoff_rarp_record.table, &e->hmap_node);
+	free(e);
+	hwoff_rarp_record.count--;
+}
+
+void rarp_mac_table_init(void)
+{
+	hmap_init(&hwoff_rarp_record.table);
+	ovs_rwlock_init(&hwoff_rarp_record.rwlock);
+	hwoff_rarp_record.count = 0;
+	rarp_record_enabled = true;
+}
+
+void rarp_mac_table_uninit(void)
+{
+	struct migrate_rarp_mac_entry *e = NULL;
+	struct migrate_rarp_mac_entry *next = NULL;
+
+	rarp_record_enabled = false;
+	ovs_rwlock_wrlock(&hwoff_rarp_record.rwlock);
+	HMAP_FOR_EACH_SAFE (e, next, hmap_node, &hwoff_rarp_record.table) {
+		rarp_mac_remove(e);
+	}
+	hmap_destroy(&hwoff_rarp_record.table);
+	hwoff_rarp_record.count = 0;
+	ovs_rwlock_unlock(&hwoff_rarp_record.rwlock);
+}
+#endif
+
 /* Returns the number of seconds since 'e' (within 'ml') was last learned. */
 int
 mac_entry_age(const struct mac_learning *ml, const struct mac_entry *e)

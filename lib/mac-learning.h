@@ -118,6 +118,35 @@ struct mac_entry {
     struct ovs_list port_lru_node; /* In mac_learning_port's "port_lru"s. */
 };
 
+#ifdef HAVE_XPF
+#define MIGRATE_MAC_MAX 8192
+
+struct migrate_rarp_mac_entry {
+	struct hmap_node hmap_node;
+	struct eth_addr mac;
+	bool need_del_flow;
+};
+
+struct migrate_rarp_macs {
+	struct hmap table;
+	uint64_t count;
+	struct ovs_rwlock rwlock;
+};
+
+struct migrate_rarp_mac_entry *rarp_mac_lookup(struct eth_addr mac);
+
+struct migrate_rarp_mac_entry *rarp_mac_insert(struct eth_addr mac);
+
+void rarp_mac_remove(struct migrate_rarp_mac_entry *e);
+
+void rarp_mac_table_init(void);
+
+void rarp_mac_table_uninit(void);
+
+extern struct migrate_rarp_macs hwoff_rarp_record;
+extern bool rarp_record_enabled;
+#endif
+
 static inline void *mac_entry_get_port(const struct mac_learning *ml,
                                        const struct mac_entry *);
 void mac_entry_set_port(struct mac_learning *, struct mac_entry *, void *port);
