@@ -3267,7 +3267,6 @@ dp_netdev_get_mega_ufid(const struct match *match, ovs_u128 *mega_ufid)
     dpif_flow_hash(NULL, &masked_flow, sizeof(struct flow), mega_ufid);
 }
 
-
 #ifdef HAVE_XPF
 static void dp_netdev_pmd_del_flow_with_smac_except_inport(struct dp_netdev_pmd_thread *pmd,
 														   struct eth_addr smac, uint32_t dp_in_port,
@@ -3296,6 +3295,20 @@ static void dp_netdev_pmd_del_flow_with_smac_except_inport(struct dp_netdev_pmd_
 	}
 }
 
+static void dp_netdev_clear_forward_flow(struct dp_netdev_pmd_thread *current_pmd,
+                                         struct eht_addr smac, uint32_t dp_in_port)
+{
+    struct dp_netdev_pmd_thread *pmd = NULL;
+    bool is_same_pmd = false;
+
+    CMAP_FOR_EACH (pmd, node, &current_pmd->dp->poll_threads) {
+        if (pmd == current_pmd) {
+            is_same_pmd = true;
+        }
+        dp_netdev_pmd_del_flow_with_smac_except_inport(pmd, smac, dp_in_port, is_same_pmd);
+    }
+}
+
 static bool is_clear_forward_flow_needed(struct dp_netdev_flow *netdev_flow,
 										 struct eth_addr *temp_mac, uint32_t *dp_in_port)
 {
@@ -3303,7 +3316,7 @@ static bool is_clear_forward_flow_needed(struct dp_netdev_flow *netdev_flow,
 	bool clear_flow = false;
 
 	ovs_rwlock_wrlock(&hwoff_rarp_record.rwlock);
-	if (unlikely(hwoff_rarp_record.cont)) {
+	if (unlikely(hwoff_rarp_record.count)) {
 		e = rarp_mac_lookup(netdev_flow->flow.dl_src);
 		if (e && e->need_del_flow) {
 			rarp_mac_remove(e);
