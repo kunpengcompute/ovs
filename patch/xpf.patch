@@ -1,0 +1,2170 @@
+diff --git a/acinclude.m4 b/acinclude.m4
+index 9e1569b07..7f9a9b4df 100644
+--- a/acinclude.m4
++++ b/acinclude.m4
+@@ -1297,3 +1297,17 @@ AC_DEFUN([OVS_CHECK_LINUX_HOST],
+         [ovs_cv_linux=true],
+         [ovs_cv_linux=false])])
+    AM_CONDITIONAL([LINUX], [$ovs_cv_linux])])
++
++dnl OVS_CHECK_XPF
++dnl
++dnl Check whether we're building with xpf.
++AC_DEFUN([OVS_CHECK_XPF],
++	[AC_ARG_ENABLE(
++		[xpf],
++		[AC_HELP_STRING([--enable-xpf], [Enable OVS XPF support])],
++		[], [enable_xpf=no])
++	if test "x$enable_xpf" = xyes; then
++	    AC_DEFINE([HAVE_XPF],[1],[ovs enable xpf])
++	fi
++    AM_CONDITIONAL([HAVE_XPF],[test $enable_xpf = yes])
++	])
+diff --git a/configure.ac b/configure.ac
+index 5fee8e9eb..9d1923832 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -190,6 +190,7 @@ OVS_CHECK_LINUX
+ OVS_CHECK_LINUX_TC
+ OVS_CHECK_LINUX_SCTP_CT
+ OVS_CHECK_DPDK
++OVS_CHECK_XPF
+ OVS_CHECK_PRAGMA_MESSAGE
+ AC_SUBST([OVS_CFLAGS])
+ AC_SUBST([OVS_LDFLAGS])
+diff --git a/include/openvswitch/vlog.h b/include/openvswitch/vlog.h
+index 19da4ab62..e6343661f 100644
+--- a/include/openvswitch/vlog.h
++++ b/include/openvswitch/vlog.h
+@@ -35,6 +35,7 @@
+ #include <openvswitch/thread.h>
+ #include <openvswitch/token-bucket.h>
+ #include <openvswitch/util.h>
++#include <openvswitch/dynamic-string.h>
+ 
+ #ifdef  __cplusplus
+ extern "C" {
+@@ -299,6 +300,10 @@ void vlog_usage(void);
+             *(ERRP) = xasprintf(__VA_ARGS__);                           \
+         }                                                               \
+     } while (0)
++void format_log_message(const struct vlog_module *, enum vlog_level,
++                              const char *pattern,
++                              const char *message, va_list, struct ds *)
++    OVS_PRINTF_FORMAT(4, 0);
+ 
+ #ifdef  __cplusplus
+ }
+diff --git a/lib/automake.mk b/lib/automake.mk
+index 17b36b43d..33733541f 100644
+--- a/lib/automake.mk
++++ b/lib/automake.mk
+@@ -20,6 +20,10 @@ lib_libopenvswitch_la_LDFLAGS = \
+         -Wl,--version-script=$(top_builddir)/lib/libopenvswitch.sym \
+         $(AM_LDFLAGS)
+ 
++if HAVE_XPF
++lib_libopenvswitch_la_LDFLAGS += -lxpf -lxpf_hwoff_frame
++endif
++
+ lib_libopenvswitch_la_SOURCES = \
+ 	lib/aes128.c \
+ 	lib/aes128.h \
+diff --git a/lib/conntrack-icmp.c b/lib/conntrack-icmp.c
+index 63246f012..f5405a27c 100644
+--- a/lib/conntrack-icmp.c
++++ b/lib/conntrack-icmp.c
+@@ -23,6 +23,12 @@
+ 
+ #include "conntrack-private.h"
+ #include "dp-packet.h"
++#include "dpif-netdev.h"
++
++#if HAVE_XPF
++#include <xpf_hook.h>
++#include <xpf_hook_arg.h>
++#endif
+ 
+ enum OVS_PACKED_ENUM icmp_state {
+     ICMPS_FIRST,
+@@ -50,9 +56,23 @@ icmp_conn_update(struct conntrack *ct, struct conn *conn_,
+                  struct dp_packet *pkt OVS_UNUSED, bool reply, long long now)
+ {
+     struct conn_icmp *conn = conn_icmp_cast(conn_);
++#if HAVE_XPF
++	struct ct_hook_update_arg hook_arg;
++#endif
+     conn->state = reply ? ICMPS_REPLY : ICMPS_FIRST;
+     conn_update_expiration(ct, &conn->up, icmp_timeouts[conn->state], now);
+ 
++#if HAVE_XPF
++	if (pkt) {
++	    hook_arg.pkt = pkt;
++		hook_arg.ct_zone = conn_->key.zone;
++		hook_arg.ct_state = CS_ESTABLISHED | CS_TRACKED;
++		hook_arg.protocol_state = conn->state;
++		hook_arg.seq = conn_->offload.seq;
++		xpf_hook_run_without_filter(get_hook_ovs_pkt(), PKT_HOOK_UPDATE_CT, &hook_arg);
++	}
++#endif
++
+     return CT_UPDATE_VALID;
+ }
+ 
+@@ -85,14 +105,27 @@ icmp_new_conn(struct conntrack *ct, struct dp_packet *pkt OVS_UNUSED,
+     return &conn->up;
+ }
+ 
++#if HAVE_XPF
++static void icmp_conn_state_sync(struct conntrack *ct, struct conn *conn, bool reply, long long hw_last_used)
++{
++	icmp_conn_update(ct, conn, NULL, reply, hw_last_used);
++}
++#endif
++
+ struct ct_l4_proto ct_proto_icmp4 = {
+     .new_conn = icmp_new_conn,
+     .valid_new = icmp4_valid_new,
+     .conn_update = icmp_conn_update,
++#if HAVE_XPF
++	.conn_state_sync = icmp_conn_state_sync,
++#endif
+ };
+ 
+ struct ct_l4_proto ct_proto_icmp6 = {
+     .new_conn = icmp_new_conn,
+     .valid_new = icmp6_valid_new,
+     .conn_update = icmp_conn_update,
++#if HAVE_XPF
++	.conn_state_sync = icmp_conn_state_sync,
++#endif
+ };
+diff --git a/lib/conntrack-other.c b/lib/conntrack-other.c
+index 932f2f4ad..296cb48bb 100644
+--- a/lib/conntrack-other.c
++++ b/lib/conntrack-other.c
+@@ -18,6 +18,12 @@
+ 
+ #include "conntrack-private.h"
+ #include "dp-packet.h"
++#include "dpif-netdev.h"
++
++#if HAVE_XPF
++#include <xpf_hook.h>
++#include <xpf_hook_arg.h>
++#endif
+ 
+ enum OVS_PACKED_ENUM other_state {
+     OTHERS_FIRST,
+@@ -47,6 +53,9 @@ other_conn_update(struct conntrack *ct, struct conn *conn_,
+                   struct dp_packet *pkt OVS_UNUSED, bool reply, long long now)
+ {
+     struct conn_other *conn = conn_other_cast(conn_);
++#if HAVE_XPF
++	struct ct_hook_update_arg hook_arg;
++#endif
+ 
+     if (reply && conn->state != OTHERS_BIDIR) {
+         conn->state = OTHERS_BIDIR;
+@@ -56,6 +65,17 @@ other_conn_update(struct conntrack *ct, struct conn *conn_,
+ 
+     conn_update_expiration(ct, &conn->up, other_timeouts[conn->state], now);
+ 
++#if HAVE_XPF
++    if (pkt) {
++	    hook_arg.pkt = pkt;
++		hook_arg.ct_zone = conn_->key.zone;
++		hook_arg.ct_state = CS_ESTABLISHED | CS_TRACKED;
++		hook_arg.protocol_state = conn->state;
++		hook_arg.seq = conn_->offload.seq;
++		xpf_hook_run_without_filter(get_hook_ovs_pkt(), PKT_HOOK_UPDATE_CT, &hook_arg);
++	}
++#endif
++
+     return CT_UPDATE_VALID;
+ }
+ 
+@@ -79,8 +99,19 @@ other_new_conn(struct conntrack *ct, struct dp_packet *pkt OVS_UNUSED,
+     return &conn->up;
+ }
+ 
++#if HAVE_XPF
++static void
++other_conn_state_sync(struct conntrack *ct, struct conn *conn, bool reply, long long hw_last_used)
++{
++	other_conn_update(ct, conn, NULL, reply, hw_last_used);
++}
++#endif
++
+ struct ct_l4_proto ct_proto_other = {
+     .new_conn = other_new_conn,
+     .valid_new = other_valid_new,
+     .conn_update = other_conn_update,
++#if HAVE_XPF
++	.conn_state_sync = other_conn_state_sync,
++#endif
+ };
+diff --git a/lib/conntrack-private.h b/lib/conntrack-private.h
+index bcfbe104b..9abe75158 100644
+--- a/lib/conntrack-private.h
++++ b/lib/conntrack-private.h
+@@ -88,6 +88,14 @@ enum OVS_PACKED_ENUM ct_conn_type {
+     CT_CONN_TYPE_UN_NAT,
+ };
+ 
++#if HAVE_XPF
++enum {
++	CT_DIR_ORIGIN,
++	CT_DIR_REPLY,
++	CT_DIR_MAX
++};
++#endif
++
+ struct conn {
+     /* Immutable data. */
+     struct conn_key key;
+@@ -112,6 +120,17 @@ struct conn {
+     /* Immutable data. */
+     bool alg_related; /* True if alg data connection. */
+     enum ct_conn_type conn_type;
++
++#if HAVE_XPF
++	struct {
++		/**
++		 * Seq is used to distinguish connection which is
++		 * closed and opened again with the same 5 tuple
++		 */
++		uint64_t seq;
++		uint64_t hw_ufid[CT_DIR_MAX];
++	} offload;
++#endif
+ };
+ 
+ enum ct_update_res {
+@@ -159,6 +178,12 @@ struct conntrack {
+     pthread_t clean_thread; /* Periodically cleans up connection tracker. */
+     struct latch clean_thread_exit; /* To destroy the 'clean_thread'. */
+ 
++#if HAVE_XPF
++	/* Increase this sequence once a new connection created */
++	uint64_t seq;
++	bool offload_is_on; /*offload is enabled */
++#endif
++
+     /* Counting connections. */
+     atomic_count n_conn; /* Number of connections currently tracked. */
+     atomic_uint n_conn_limit; /* Max connections tracked. */
+@@ -195,6 +220,10 @@ struct ct_l4_proto {
+                                       long long now);
+     void (*conn_get_protoinfo)(const struct conn *,
+                                struct ct_dpif_protoinfo *);
++#if HAVE_XPF
++	void (*conn_state_sync)(struct conntrack * ct, struct conn *conn, bool reply,
++							long long hw_last_used);
++#endif
+ };
+ 
+ extern long long ct_timeout_val[];
+diff --git a/lib/conntrack-tcp.c b/lib/conntrack-tcp.c
+index 397aca1dc..2e8f5fad5 100644
+--- a/lib/conntrack-tcp.c
++++ b/lib/conntrack-tcp.c
+@@ -42,6 +42,13 @@
+ #include "ct-dpif.h"
+ #include "dp-packet.h"
+ #include "util.h"
++#include "dpif-netdev.h"
++
++#if HAVE_XPF
++#include <xpf_hook.h>
++#include <xpf_hook_arg.h>
++
++#endif
+ 
+ struct tcp_peer {
+     uint32_t               seqlo;          /* Max sequence number sent     */
+@@ -144,6 +151,80 @@ tcp_get_wscale(const struct tcp_header *tcp)
+     return wscale;
+ }
+ 
++#if HAVE_XPF
++static enum ct_update_res
++tcp_conn_update_skip_sequence_check(struct conntrack *ct, struct conn *conn_,
++									struct dp_packet *pkt, bool reply, long long now)
++{
++	struct conn_tcp *conn = conn_tcp_cast(conn_);
++	struct tcp_header *tcp = dp_packet_l4(pkt);
++	/* The peer that sent 'pkt' */
++	struct tcp_peer *src = &conn->peer[reply ? 1 : 0];
++	/* The peer that should receive 'pkt' */
++	struct tcp_peer *dst = &conn->peer[reply ? 0 : 1];
++	uint64_t tcp_flags = TCP_FLAGS(tcp->tcp_ctl);
++	struct ct_hook_update_arg hook_arg;
++
++	if (tcp_invalid_flags(tcp_flags)) {
++		return CT_UPDATE_INVALID;
++	}
++
++	if(((tcp_flags & (TCP_SYN | TCP_ACK))== TCP_SYN)
++		&& dst->state >= CT_DPIF_TCPS_CLOSING
++		&& src->state >= CT_DPIF_TCPS_CLOSING) {
++		src->state = dst->state = CT_DPIF_TCPS_CLOSED;
++		return CT_UPDATE_NEW;
++	}
++	
++	/* update states */
++	if (src->state < CT_DPIF_TCPS_SYN_SENT) {
++		/*	First packet from this end. Set its state */
++		src->state = CT_DPIF_TCPS_SYN_SENT;
++	}
++
++	if ((tcp_flags & TCP_FIN) && src->state < CT_DPIF_TCPS_CLOSING) {
++		src->state = CT_DPIF_TCPS_CLOSING;
++	}
++
++	if(tcp_flags & TCP_ACK) {
++		if(dst->state == CT_DPIF_TCPS_SYN_SENT) {
++			dst->state = CT_DPIF_TCPS_ESTABLISHED;
++		} else if(dst->state == CT_DPIF_TCPS_CLOSING) {
++			dst->state = CT_DPIF_TCPS_TIME_WAIT;
++		}
++	}
++
++	if (tcp_flags & TCP_RST) {
++		src->state = dst->state = CT_DPIF_TCPS_TIME_WAIT;
++	}
++
++	if (src->state >= CT_DPIF_TCPS_FIN_WAIT_2
++		&& dst->state >= CT_DPIF_TCPS_FIN_WAIT_2) {
++		conn_update_expiration(ct, &conn->up, CT_TM_TCP_CLOSED, now);
++	} else if (src->state >= CT_DPIF_TCPS_CLOSING
++			    && dst->state >= CT_DPIF_TCPS_CLOSING) {
++		conn_update_expiration(ct, &conn->up, CT_TM_TCP_FIN_WAIT, now);
++	} else if (src->state < CT_DPIF_TCPS_ESTABLISHED
++				|| dst->state < CT_DPIF_TCPS_ESTABLISHED) {
++		conn_update_expiration(ct, &conn->up, CT_TM_TCP_OPENING, now);
++	} else if (src->state >= CT_DPIF_TCPS_CLOSING
++				|| dst->state >= CT_DPIF_TCPS_CLOSING) {
++		conn_update_expiration(ct, &conn->up, CT_TM_TCP_CLOSING, now);
++	} else {
++		conn_update_expiration(ct, &conn->up, CT_TM_TCP_ESTABLISHED, now);
++	}
++
++	hook_arg.pkt = pkt;
++	hook_arg.ct_zone = conn_->key.zone;
++	hook_arg.ct_state = CS_ESTABLISHED | CS_TRACKED;
++	hook_arg.protocol_state = src->state;
++	hook_arg.seq = conn_->offload.seq;
++	xpf_hook_run_without_filter(get_hook_ovs_pkt(), PKT_HOOK_UPDATE_CT, &hook_arg);
++
++	return CT_UPDATE_VALID;
++}
++#endif
++
+ static enum ct_update_res
+ tcp_conn_update(struct conntrack *ct, struct conn *conn_,
+                 struct dp_packet *pkt, bool reply, long long now)
+@@ -160,6 +241,11 @@ tcp_conn_update(struct conntrack *ct, struct conn *conn_,
+     uint16_t win = ntohs(tcp->tcp_winsz);
+     uint32_t ack, end, seq, orig_seq;
+     uint32_t p_len = tcp_payload_length(pkt);
++#if HAVE_XPF
++	if (ct->offload_is_on) {
++		return tcp_conn_update_skip_sequence_check(ct, conn_, pkt, reply, now);
++	}
++#endif
+ 
+     if (tcp_invalid_flags(tcp_flags)) {
+         return CT_UPDATE_INVALID;
+diff --git a/lib/conntrack.c b/lib/conntrack.c
+index e5266e579..210ef5312 100644
+--- a/lib/conntrack.c
++++ b/lib/conntrack.c
+@@ -39,6 +39,16 @@
+ #include "openvswitch/poll-loop.h"
+ #include "random.h"
+ #include "timeval.h"
++#include "dpif-netdev.h"
++
++
++#if HAVE_XPF
++#include <xpf_config.h>
++#include <xpf_component.h>
++#include <xpf_component_arg.h>
++#include <xpf_hook.h>
++#include <xpf_hook_arg.h>
++#endif
+ 
+ VLOG_DEFINE_THIS_MODULE(conntrack);
+ 
+@@ -76,6 +86,11 @@ enum ct_alg_ctl_type {
+     CT_ALG_CTL_SIP,
+ };
+ 
++#if HAVE_XPF
++static bool
++update_offloaded_conn_expiration(struct conntrack *ct,
++			                     struct conn *conn, long long now);
++#endif
+ static bool conn_key_extract(struct conntrack *, struct dp_packet *,
+                              ovs_be16 dl_type, struct conn_lookup_ctx *,
+                              uint16_t zone);
+@@ -176,6 +191,15 @@ long long ct_timeout_val[] = {
+ #undef CT_TIMEOUT
+ };
+ 
++#if HAVE_XPF
++static int conn_public(struct xpf_component *comp, struct xpf_component_arg *arg);
++static struct xpf_component_class conn_mod = {
++    .name = "ovs-ct",
++	.id = COM_OVS_CT,
++	.provide_ops = conn_public,
++};
++#endif
++
+ /* The maximum TCP or UDP port number. */
+ #define CT_MAX_L4_PORT 65535
+ /* String buffer used for parsing FTP string messages.
+@@ -314,6 +338,10 @@ conntrack_init(void)
+     ct->clean_thread = ovs_thread_create("ct_clean", clean_thread_main, ct);
+     ct->ipf = ipf_init();
+ 
++#if HAVE_XPF
++	xpf_component_register(&conn_mod);
++#endif
++
+     return ct;
+ }
+ 
+@@ -907,6 +935,9 @@ conn_not_found(struct conntrack *ct, struct dp_packet *pkt,
+         nc->nat_conn = nat_conn;
+         ovs_mutex_init_adaptive(&nc->lock);
+         nc->conn_type = CT_CONN_TYPE_DEFAULT;
++#if HAVE_XPF
++		nc->offload.seq = ++ct->seq;
++#endif
+         cmap_insert(&ct->conns, &nc->cm_node, ctx->hash);
+         atomic_count_inc(&ct->n_conn);
+         ctx->conn = nc; /* For completeness. */
+@@ -1298,6 +1329,12 @@ ct_sweep(struct conntrack *ct, long long now, size_t limit)
+                 break;
+             } else {
+                 ovs_mutex_unlock(&conn->lock);
++#if HAVE_XPF
++				if (!update_offloaded_conn_expiration(ct, conn, now)) {
++				    /* Not expired yet */
++					continue;
++				}
++#endif
+                 conn_clean(ct, conn);
+             }
+             count++;
+@@ -2152,6 +2189,13 @@ new_conn(struct conntrack *ct, struct dp_packet *pkt, struct conn_key *key,
+ static void
+ delete_conn_cmn(struct conn *conn)
+ {
++#if HAVE_XPF
++	struct ct_hook_del_arg hook_arg;
++	hook_arg.seq = conn->offload.seq;
++	hook_arg.original_hw_ufid = conn->offload.hw_ufid[CT_DIR_ORIGIN];
++	hook_arg.reply_hw_ufid = conn->offload.hw_ufid[CT_DIR_REPLY];
++	xpf_hook_run_without_filter(get_hook_ovs_flow(), FLOW_HOOK_DEL_CT, &hook_arg);
++#endif
+     free(conn->nat_info);
+     free(conn->alg);
+     free(conn);
+@@ -3075,3 +3119,176 @@ handle_tftp_ctl(struct conntrack *ct,
+                        conn_for_expectation,
+                        !!(pkt->md.ct_state & CS_REPLY_DIR), false, false);
+ }
++
++#if HAVE_XPF
++/**
++ * Update expiration time of connection.
++ * return true if expired after updating.
++ * 
++ * Warning: ctb lock must be taken before calling this function
++ * */
++static bool
++update_offloaded_conn_expiration(struct conntrack *ct,
++			                     struct conn *conn, long long now)
++{
++	struct ct_l4_proto *proto_ops = l4_protos[conn->key.nw_proto];
++	bool expired = false;
++
++	if (!proto_ops || !proto_ops->conn_state_sync) {
++	    return true;
++	}
++
++	for (int dir = 0; dir < CT_DIR_MAX; dir++) {
++	    struct com_flow_agent_update_ct_age_arg arg;
++
++		if (!conn->offload.hw_ufid[dir]) {
++		    continue;
++		}
++
++		arg.base.op = COM_FLOW_AGENT_UPDATE_CT_AGE;
++		arg.base.version = XPF_COMPONENT_FLOW_AGENT_ARG_VERSION;
++		arg.in.hw_ufid = conn->offload.hw_ufid[dir];
++		arg.out.hw_last_used = 0;
++		xpf_component_call(COM_XPF_FLOW_AGENT, &arg.base);
++		if (arg.out.hw_last_used == 0) {
++		    continue;
++		}
++		ovs_mutex_unlock(&ct->ct_lock);
++		ovs_mutex_lock(&conn->lock);
++		proto_ops->conn_state_sync(ct, conn, dir, arg.out.hw_last_used);
++		ovs_mutex_unlock(&conn->lock);
++		ovs_mutex_lock(&ct->ct_lock);
++	}
++
++	if ((conn->conn_type == CT_CONN_TYPE_DEFAULT) && 
++		 (now >= conn->expiration)) {
++	    expired = true;
++	}
++
++	return expired;
++}
++
++static int
++conn_update_offload_state(struct conntrack *ct, ovs_be16 ether_type, union ct_addr *sip, union ct_addr *dip,
++			              ovs_be16 sport, ovs_be16 dport, uint8_t proto,
++						  uint16_t zone, uint64_t hw_ufid, const void *proto_state,
++						  long long hw_last_used)
++{
++	struct conn *conn = NULL;
++	long long now = time_msec();
++	struct conn_key key;
++	bool reply = false;
++
++	/* Construct key */
++	memset(&key, 0, sizeof(key));
++	key.zone = zone;
++	key.dl_type = ether_type;
++	key.src.addr = *sip;
++	key.dst.addr = *dip;
++	key.nw_proto = proto;
++	if (proto == IPPROTO_ICMP) {
++	    uint8_t icmp_type = ((uint8_t *)&sport)[1];
++		if ((icmp_type == ICMP4_ECHO_REQUEST) || 
++			(icmp_type == ICMP4_ECHO_REPLY)) {
++		    key.src.icmp_id = key.dst.icmp_id = dport;
++			key.src.icmp_type = icmp_type;
++			key.dst.icmp_type = reverse_icmp_type(icmp_type);
++		} else {
++		    VLOG_WARN("unspported icmp type: %d", icmp_type);
++		}
++	} else if (proto == IPPROTO_ICMPV6) {
++	    uint8_t icmp6_type = ((uint8_t *)&sport)[1];
++		if ((icmp6_type == ICMP6_ECHO_REQUEST) || 
++			(icmp6_type == ICMP6_ECHO_REPLY)) {
++		    key.src.icmp_id = key.dst.icmp_id = dport;
++			key.src.icmp_type = icmp6_type;
++			key.dst.icmp_type = reverse_icmp6_type(icmp6_type);
++		} else {
++		    VLOG_WARN("unsupported icmp type: %d", icmp6_type);
++		}
++	} else {
++	   key.src.port = sport;
++	   key.dst.port = dport;
++	}
++
++	if (!conn_lookup(ct, &key, now, &conn, &reply)) {
++	    return 0;
++	}
++
++	if (conn->conn_type == CT_CONN_TYPE_UN_NAT) {
++	    struct conn *rev_conn = conn;
++
++		reply = true;
++		if (!conn_lookup(ct, &rev_conn->rev_key, now, &conn, &reply)) {
++		    return 0;
++		}
++	}
++
++	/**
++	 * When hw ufid is not zero, proto_state is used as connection sequence list.
++	 * The first element decleares the length of list.
++	 */
++	if (hw_ufid && proto_state) {
++	    uint64_t num = ((uint64_t *)proto_state)[0];
++		int idx, end_idx = num + 1;
++
++		/**
++		 * Cancel offloading if connection sequence changed after offloading,
++		 * which means connection is possibly destroyed and created agin.
++		 */
++		for (idx = 1; idx < end_idx; idx++) {
++		    if (conn->offload.seq == ((uint64_t *)proto_state)[idx]) {
++			    break;
++			}
++		}
++		if (idx == end_idx) {
++		    return -1;
++		}
++	}
++
++	/* Update expiration only when connection is not offloaded */
++	if (!hw_ufid && l4_protos[proto] && l4_protos[proto]->conn_state_sync) {
++	    ovs_mutex_lock(&conn->lock);
++		l4_protos[proto]->conn_state_sync(ct, conn, reply, hw_last_used);
++		ovs_mutex_unlock(&conn->lock);
++	}
++
++	conn->offload.hw_ufid[reply] = hw_ufid;
++	return 0;
++}
++
++static int conn_public(struct xpf_component *comp OVS_UNUSED, struct xpf_component_arg *arg)
++{
++	int ret = 0;
++
++	if (arg->version != XPF_COMPONENT_CT_ARG_VERSION) {
++	    return -1;
++	}
++
++	switch (arg->op) {
++	    case COM_CT_UPDATE_OFFLOAD_STATE: {
++		    struct com_ct_update_offload_state_arg *xarg = (struct com_ct_update_offload_state_arg *)arg;
++			xarg->out.ret = conn_update_offload_state(xarg->in.ct, xarg->in.ether_type,
++						                              (union ct_addr *)xarg->in.sip, (union ct_addr *)xarg->in.dip,
++													  xarg->in.sport, xarg->in.dport, xarg->in.proto, xarg->in.zone,
++													  xarg->in.hw_ufid, xarg->in.proto_state, xarg->in.hw_last_used);
++			break;
++		}
++      case COM_CT_FLUSH: {
++		struct com_ct_flush_arg *xarg = (struct com_ct_flush_arg *)arg;
++        if (xarg->in.sip == NULL && xarg->in.dip == NULL) {
++		    conntrack_flush(xarg->in.ct, xarg->in.zone);
++		} else {
++		    /* TBD: conntrack_flush_tuple() */
++		}
++		break;
++	   }
++	  case COM_CT_ENABLE_OFFLOAD: {
++	       struct com_ct_enable_offload_arg *xarg = (struct com_ct_enable_offload_arg *)arg;
++		   ((struct conntrack *)xarg->in.ct)->offload_is_on = xarg->in.enable;
++		   break;
++		}
++	}
++	return ret;
++}
++#endif
+diff --git a/lib/dp-packet.h b/lib/dp-packet.h
+index 14f0897fa..90d6c7469 100644
+--- a/lib/dp-packet.h
++++ b/lib/dp-packet.h
+@@ -47,6 +47,9 @@ enum OVS_PACKED_ENUM dp_packet_source {
+ };
+ 
+ #define DP_PACKET_CONTEXT_SIZE 64
++#ifdef HAVE_XPF
++#define PKT_RX_HW_OFFLOAD_INFO (1ULL << 39)
++#endif /* HAVE_XPF */
+ 
+ #ifndef DPDK_NETDEV
+ /* Bit masks for the 'ol_flags' member of the 'dp_packet' structure. */
+@@ -538,7 +541,11 @@ dp_packet_rss_valid(const struct dp_packet *p)
+ static inline void
+ dp_packet_reset_offload(struct dp_packet *p)
+ {
++#ifdef HAVE_XPF
++	p->mbuf.ol_flags &= PKT_RX_HW_OFFLOAD_INFO;
++#else
+     p->mbuf.ol_flags = 0;
++#endif
+ }
+ 
+ static inline bool
+diff --git a/lib/dpdk.c b/lib/dpdk.c
+index f31e1580c..ddf4831f9 100644
+--- a/lib/dpdk.c
++++ b/lib/dpdk.c
+@@ -107,6 +107,7 @@ construct_dpdk_options(const struct smap *ovs_other_config, struct svec *args)
+         {"dpdk-lcore-mask",   "-c",             false, NULL},
+         {"dpdk-hugepage-dir", "--huge-dir",     false, NULL},
+         {"dpdk-socket-limit", "--socket-limit", false, NULL},
++		{"dpdk-pmd-driver", "-d", false, NULL},
+     };
+ 
+     int i;
+@@ -439,17 +440,10 @@ dpdk_init__(const struct smap *ovs_other_config)
+ 
+ #ifdef DPDK_PDUMP
+     VLOG_INFO("DPDK pdump packet capture enabled");
+-    err = rte_pdump_init(ovs_rundir());
++    err = rte_pdump_init();
+     if (err) {
+         VLOG_INFO("Error initialising DPDK pdump");
+         rte_pdump_uninit();
+-    } else {
+-        char *server_socket_path;
+-
+-        server_socket_path = xasprintf("%s/%s", ovs_rundir(),
+-                                       "pdump_server_socket");
+-        fatal_signal_add_file_to_unlink(server_socket_path);
+-        free(server_socket_path);
+     }
+ #endif
+ 
+diff --git a/lib/dpif-netdev.c b/lib/dpif-netdev.c
+index 75d85b2fd..4efccfc1e 100644
+--- a/lib/dpif-netdev.c
++++ b/lib/dpif-netdev.c
+@@ -80,6 +80,16 @@
+ #include "util.h"
+ #include "uuid.h"
+ 
++#if HAVE_XPF
++#include <xpf_config.h>
++#include <xpf_component.h>
++#include <xpf_component_arg.h>
++#include <xpf_hook.h>
++#include <xpf_hook_arg.h>
++#include <hwoff_init.h>
++#include "mac-learning.h"
++#endif
++
+ VLOG_DEFINE_THIS_MODULE(dpif_netdev);
+ 
+ /* Auto Load Balancing Defaults */
+@@ -129,6 +139,19 @@ static struct odp_support dp_netdev_support = {
+     .ct_orig_tuple6 = true,
+ };
+ 
++void *hook_provider_ovs_flow;
++void *hook_provider_ovs_pkt;
++
++void *get_hook_ovs_flow(void)
++{
++    return hook_provider_ovs_flow;
++}
++
++void *get_hook_ovs_pkt(void)
++{
++    return hook_provider_ovs_pkt;
++}
++
+ /* EMC cache and SMC cache compose the datapath flow cache (DFC)
+  *
+  * Exact match cache for frequently used flows
+@@ -526,6 +549,7 @@ struct dp_netdev_flow {
+     struct ovs_refcount ref_cnt;
+ 
+     bool dead;
++	bool offloadable;
+     uint32_t mark;               /* Unique flow mark assigned to a flow */
+ 
+     /* Statistics. */
+@@ -857,6 +881,9 @@ static inline bool
+ pmd_perf_metrics_enabled(const struct dp_netdev_pmd_thread *pmd);
+ static void queue_netdev_flow_del(struct dp_netdev_pmd_thread *pmd,
+                                   struct dp_netdev_flow *flow);
++#ifdef HAVE_XPF
++static void dpif_netdev_init_xpf(void);
++#endif
+ 
+ static void
+ emc_cache_init(struct emc_cache *flow_cache)
+@@ -1415,7 +1442,11 @@ dpif_netdev_init(void)
+                              "on|off [-b before] [-a after] [-e|-ne] "
+                              "[-us usec] [-q qlen]",
+                              0, 10, pmd_perf_log_set_cmd,
+-                             NULL);
++							 NULL);
++
++#ifdef HAVE_XPF
++	dpif_netdev_init_xpf();
++#endif
+     return 0;
+ }
+ 
+@@ -1574,6 +1605,18 @@ create_dp_netdev(const char *name, const struct dpif_class *class,
+         return error;
+     }
+ 
++#ifdef DPDK_NETDEV
++	if (dpdk_shared_mp_init() != 0) {
++		VLOG_ERR("Failed to init shared memory pool.");
++		dp_netdev_free(dp);
++		return -1;
++	}
++
++#ifdef HAVE_XPF
++	hwoff_offload_component_load_hook();
++#endif /* HAVE_XPF */
++#endif
++
+     dp->last_tnl_conf_seq = seq_read(tnl_conf_seq);
+     *dpp = dp;
+     return 0;
+@@ -1685,7 +1728,9 @@ dp_netdev_free(struct dp_netdev *dp)
+     for (i = 0; i < N_METER_LOCKS; ++i) {
+         ovs_mutex_destroy(&dp->meter_locks[i]);
+     }
+-
++#ifdef DPDK_NETDEV
++	(void)dpdk_shared_mp_uninit();
++#endif
+     free(dp->pmd_cmask);
+     free(CONST_CAST(char *, dp->name));
+     free(dp);
+@@ -1990,6 +2035,25 @@ get_port_by_name(struct dp_netdev *dp,
+     return ENODEV;
+ }
+ 
++odp_port_t
++dpif_netdev_get_odp_no_by_name(const char *devname)
++{
++	struct dp_netdev_port *port = NULL;
++	struct dp_netdev *dp = shash_find_data(&dp_netdevs, "ovs-netdev");
++	int error;
++
++	if (dp == NULL) {
++		return ODPP_NONE;
++	}
++
++	error = get_port_by_name(dp, devname, &port);
++	if (error !=0 ) {
++		return ODPP_NONE;
++	}
++	
++	return port->port_no;
++}
++
+ /* Returns 'true' if there is a port with pmd netdev. */
+ static bool
+ has_pmd_port(struct dp_netdev *dp)
+@@ -2568,6 +2632,10 @@ dpif_netdev_flow_flush(struct dpif *dpif)
+     struct dp_netdev *dp = get_dp_netdev(dpif);
+     struct dp_netdev_pmd_thread *pmd;
+ 
++#ifdef HAVE_XPF
++	xpf_hook_run_without_filter(hook_provider_ovs_flow, FLOW_HOOK_FLUSH_FLOW, NULL);
++#endif
++
+     CMAP_FOR_EACH (pmd, node, &dp->poll_threads) {
+         dp_netdev_pmd_flow_flush(pmd);
+     }
+@@ -3199,6 +3267,164 @@ dp_netdev_get_mega_ufid(const struct match *match, ovs_u128 *mega_ufid)
+     dpif_flow_hash(NULL, &masked_flow, sizeof(struct flow), mega_ufid);
+ }
+ 
++#ifdef HAVE_XPF
++static void dp_netdev_pmd_del_flow_with_smac_except_inport(struct dp_netdev_pmd_thread *pmd,
++														   struct eth_addr smac, uint32_t dp_in_port,
++														   bool is_same_pmd)
++{
++	struct dp_netdev_flow *netdev_flow = NULL;
++	struct dp_flow_hook_flow_del_arg hook_arg;
++
++	if (is_same_pmd != true) {
++		ovs_mutex_lock(&pmd->flow_mutex);
++	}
++
++	CMAP_FOR_EACH (netdev_flow, node, &pmd->flow_table) {
++		if (eth_addr_equals(netdev_flow->flow.dl_src, smac)
++			&& (netdev_flow->flow.in_port.odp_port != dp_in_port)
++			&& !eth_addr_is_broadcast(netdev_flow->flow.dl_dst)) {
++			hook_arg.core_id = pmd->core_id;
++			hook_arg.flow_ufid = (void *)&netdev_flow->ufid;
++			hook_arg.flow = netdev_flow;
++			xpf_hook_run_without_filter(hook_provider_ovs_flow, FLOW_HOOK_DEL_FLOW, &hook_arg);
++		}
++	}
++
++	if (is_same_pmd != true) {
++		ovs_mutex_unlock(&pmd->flow_mutex);
++	}
++}
++
++static void dp_netdev_clear_forward_flow(struct dp_netdev_pmd_thread *current_pmd,
++                                         struct eht_addr smac, uint32_t dp_in_port)
++{
++    struct dp_netdev_pmd_thread *pmd = NULL;
++    bool is_same_pmd = false;
++
++    CMAP_FOR_EACH (pmd, node, &current_pmd->dp->poll_threads) {
++        if (pmd == current_pmd) {
++            is_same_pmd = true;
++        }
++        dp_netdev_pmd_del_flow_with_smac_except_inport(pmd, smac, dp_in_port, is_same_pmd);
++    }
++}
++
++static bool is_clear_forward_flow_needed(struct dp_netdev_flow *netdev_flow,
++										 struct eth_addr *temp_mac, uint32_t *dp_in_port)
++{
++	struct migrate_rarp_mac_entry *e = NULL;
++	bool clear_flow = false;
++
++	ovs_rwlock_wrlock(&hwoff_rarp_record.rwlock);
++	if (unlikely(hwoff_rarp_record.count)) {
++		e = rarp_mac_lookup(netdev_flow->flow.dl_src);
++		if (e && e->need_del_flow) {
++			rarp_mac_remove(e);
++			(void)memcpy(&temp_mac->ea, &netdev_flow->flow.dl_src.ea, ETH_ADDR_LEN);
++			*dp_in_port = netdev_flow->flow.in_port.odp_port;
++			clear_flow = true;
++		}
++	}
++	ovs_rwlock_unlock(&hwoff_rarp_record.rwlock);
++	
++	return clear_flow;
++}
++
++static void dp_netdev_pmd_del_flow_with_smac(struct dp_netdev_pmd_thread *pmd, struct eth_addr smac)
++{
++	struct dp_netdev_flow *netdev_flow = NULL;
++	struct dp_flow_hook_flow_del_arg hook_arg;
++
++	ovs_mutex_lock(&pmd->flow_mutex);
++	CMAP_FOR_EACH (netdev_flow, node, &pmd->flow_table) {
++		if (eth_addr_equals(netdev_flow->flow.dl_src, smac)
++			&& !eth_addr_is_broadcast(netdev_flow->flow.dl_dst)) {
++			hook_arg.core_id = pmd->core_id;
++			hook_arg.flow_ufid = (void *)&netdev_flow->ufid;
++			hook_arg.flow = netdev_flow;
++			xpf_hook_run_without_filter(hook_provider_ovs_flow, FLOW_HOOK_DEL_FLOW, &hook_arg);
++		}
++	}
++	ovs_mutex_unlock(&pmd->flow_mutex);
++}
++
++static void dp_netdev_clear_reverse_flow(struct dp_netdev *dp, struct eth_addr smac)
++{
++	struct dp_netdev_pmd_thread *pmd = NULL;
++	CMAP_FOR_EACH (pmd, node, &dp->poll_threads) {
++		dp_netdev_pmd_del_flow_with_smac(pmd, smac);
++	}
++}
++
++static bool is_clear_reverse_flow_needed(struct dp_netdev_flow *netdev_flow, struct eth_addr *temp_mac)
++{
++	struct migrate_rarp_mac_entry *e = NULL;
++	bool clear_reverse_flow = false;
++
++	ovs_rwlock_wrlock(&hwoff_rarp_record.rwlock);
++	if (unlikely(hwoff_rarp_record.count)) {
++		e = rarp_mac_lookup(netdev_flow->flow.dl_dst);
++		if (e && e->need_del_flow) {
++			rarp_mac_remove(e);
++			(void)memcpy(&temp_mac->ea, &netdev_flow->flow.dl_dst.ea, ETH_ADDR_LEN);
++			clear_reverse_flow = true;
++		}
++	}
++	ovs_rwlock_unlock(&hwoff_rarp_record.rwlock);
++	
++	return clear_reverse_flow;
++}
++
++static void process_clear_forward_flow(struct dp_netdev_pmd_thread *pmd, struct dp_netdev_flow *flow)
++{
++	uint32_t dp_in_port = 0;
++	struct eth_addr temp_mac;
++
++	(void)memset(&temp_mac, 0, sizeof(struct eth_addr));
++	if (rarp_record_enabled && is_clear_forward_flow_needed(flow, &temp_mac, &dp_in_port)) {
++		dp_netdev_clear_forward_flow(pmd, temp_mac, dp_in_port);
++	}
++}
++
++static void process_offload_del_flow(struct dp_netdev_pmd_thread *pmd, const struct dpif_flow_del *del)
++{
++	bool clear_reverse_flow = false;
++	struct eth_addr temp_mac;
++	struct dp_netdev_flow *netdev_flow = NULL;
++	struct dp_netdev_flow *temp_del_flow = NULL;
++	struct dp_flow_hook_flow_del_arg hook_arg;
++
++	(void)memset(&temp_mac, 0, sizeof(struct eth_addr));
++
++	ovs_mutex_lock(&pmd->flow_mutex);
++	netdev_flow = dp_netdev_pmd_find_flow(pmd, del->ufid, del->key, del->key_len);
++	if (netdev_flow == NULL) {
++		ovs_mutex_unlock(&pmd->flow_mutex);
++		return;
++	}
++	temp_del_flow = xcalloc(1, sizeof(struct dp_netdev_flow));
++	if (temp_del_flow == NULL) {
++		ovs_mutex_unlock(&pmd->flow_mutex);
++		return;
++	}
++	(void)memcpy(temp_del_flow, netdev_flow, sizeof(struct dp_netdev_flow));
++	ovs_mutex_unlock(&pmd->flow_mutex);
++
++	hook_arg.core_id = pmd->core_id;
++	hook_arg.flow_ufid = (void *)&temp_del_flow->ufid;
++	hook_arg.flow = temp_del_flow;
++	xpf_hook_run_without_filter(hook_provider_ovs_flow, FLOW_HOOK_DEL_FLOW, &hook_arg);
++
++	clear_reverse_flow = is_clear_reverse_flow_needed(temp_del_flow, &temp_mac);
++	if (unlikely(clear_reverse_flow)) {
++		dp_netdev_clear_reverse_flow(pmd->dp, temp_mac);
++	}
++	free(temp_del_flow);
++	return;
++}
++
++#endif
++
+ static struct dp_netdev_flow *
+ dp_netdev_flow_add(struct dp_netdev_pmd_thread *pmd,
+                    struct match *match, const ovs_u128 *ufid,
+@@ -3233,6 +3459,7 @@ dp_netdev_flow_add(struct dp_netdev_pmd_thread *pmd,
+     flow = xmalloc(sizeof *flow - sizeof flow->cr.flow.mf + mask.len);
+     memset(&flow->stats, 0, sizeof flow->stats);
+     flow->dead = false;
++	flow->offloadable = true;
+     flow->batch = NULL;
+     flow->mark = INVALID_FLOW_MARK;
+     *CONST_CAST(unsigned *, &flow->pmd_id) = pmd->core_id;
+@@ -3297,6 +3524,10 @@ dp_netdev_flow_add(struct dp_netdev_pmd_thread *pmd,
+         ds_destroy(&ds);
+     }
+ 
++#ifdef HAVE_XPF
++	process_clear_forward_flow(pmd, flow);
++#endif
++
+     return flow;
+ }
+ 
+@@ -3311,6 +3542,13 @@ flow_put_on_pmd(struct dp_netdev_pmd_thread *pmd,
+     struct dp_netdev_flow *netdev_flow;
+     int error = 0;
+ 
++#ifdef HAVE_XPF
++	bool clear_reverse_flow = false;
++	struct eth_addr temp_mac;
++
++	(void)memset(&temp_mac, 0, sizeof(struct eth_addr));
++#endif
++
+     if (stats) {
+         memset(stats, 0, sizeof *stats);
+     }
+@@ -3333,6 +3571,15 @@ flow_put_on_pmd(struct dp_netdev_pmd_thread *pmd,
+         if (put->flags & DPIF_FP_MODIFY) {
+             struct dp_netdev_actions *new_actions;
+             struct dp_netdev_actions *old_actions;
++#ifdef HAVE_XPF
++			struct dp_flow_hook_flow_del_arg hook_arg;
++
++			hook_arg.core_id = pmd->core_id;
++			hook_arg.flow_ufid = (void *)&netdev_flow->ufid;
++			hook_arg.flow = netdev_flow;
++			xpf_hook_run_without_filter(hook_provider_ovs_flow, FLOW_HOOK_DEL_FLOW, &hook_arg);
++            clear_reverse_flow = is_clear_reverse_flow_needed(netdev_flow, &temp_mac);
++#endif
+ 
+             new_actions = dp_netdev_actions_create(put->actions,
+                                                    put->actions_len);
+@@ -3368,6 +3615,13 @@ flow_put_on_pmd(struct dp_netdev_pmd_thread *pmd,
+         }
+     }
+     ovs_mutex_unlock(&pmd->flow_mutex);
++
++#ifdef HAVE_XPF
++	if (unlikely(clear_reverse_flow)) {
++		dp_netdev_clear_reverse_flow(pmd->dp, temp_mac);
++	}
++#endif
++
+     return error;
+ }
+ 
+@@ -3458,6 +3712,10 @@ flow_del_on_pmd(struct dp_netdev_pmd_thread *pmd,
+     struct dp_netdev_flow *netdev_flow;
+     int error = 0;
+ 
++#ifdef HAVE_XPF
++	process_offload_del_flow(pmd, del);
++#endif
++
+     ovs_mutex_lock(&pmd->flow_mutex);
+     netdev_flow = dp_netdev_pmd_find_flow(pmd, del->ufid, del->key,
+                                           del->key_len);
+@@ -4173,6 +4431,11 @@ dp_netdev_pmd_flush_output_on_port(struct dp_netdev_pmd_thread *pmd,
+     struct cycle_timer timer;
+     uint64_t cycles;
+     uint32_t tx_flush_interval;
++#ifdef HAVE_XPF
++	struct dp_pkt_hook_tx_pre_arg tx_pre_hook_arg;
++	struct dp_pkt_hook_tx_post_arg tx_post_hook_arg;
++#endif
++
+ 
+     cycle_timer_start(&pmd->perf_stats, &timer);
+ 
+@@ -4186,9 +4449,27 @@ dp_netdev_pmd_flush_output_on_port(struct dp_netdev_pmd_thread *pmd,
+     output_cnt = dp_packet_batch_size(&p->output_pkts);
+     ovs_assert(output_cnt > 0);
+ 
++#ifdef HAVE_XPF
++	tx_pre_hook_arg.pkt_batch = &p->output_pkts;
++	tx_pre_hook_arg.core_id = pmd->core_id;
++	tx_pre_hook_arg.in_port = p->port->port_no;
++	tx_pre_hook_arg.dp = pmd->dp;
++	tx_pre_hook_arg.pmd = pmd;
++	xpf_hook_run_without_filter(hook_provider_ovs_pkt, PKT_HOOK_TX_PRE, &tx_pre_hook_arg);
++#endif
++
+     netdev_send(p->port->netdev, tx_qid, &p->output_pkts, dynamic_txqs);
+     dp_packet_batch_init(&p->output_pkts);
+ 
++#ifdef HAVE_XPF
++	tx_post_hook_arg.pkt_batch = &p->output_pkts;
++	tx_post_hook_arg.core_id = pmd->core_id;
++	tx_post_hook_arg.in_port = p->port->port_no;
++	tx_post_hook_arg.dp = pmd->dp;
++	tx_post_hook_arg.pmd = pmd;
++	xpf_hook_run_without_filter(hook_provider_ovs_pkt, PKT_HOOK_TX_POST, &tx_post_hook_arg);
++#endif
++
+     /* Update time of the next flush. */
+     atomic_read_relaxed(&pmd->dp->tx_flush_interval, &tx_flush_interval);
+     p->flush_time = pmd->ctx.now + tx_flush_interval;
+@@ -4244,6 +4525,10 @@ dp_netdev_process_rxq_port(struct dp_netdev_pmd_thread *pmd,
+     int batch_cnt = 0;
+     int rem_qlen = 0, *qlen_p = NULL;
+     uint64_t cycles;
++#ifdef HAVE_XPF
++	struct dp_pkt_hook_rx_post_arg hook_arg;
++	struct dp_pkt_hook_rx_pre_arg rx_pre_arg;
++#endif
+ 
+     /* Measure duration for polling and processing rx burst. */
+     cycle_timer_start(&pmd->perf_stats, &timer);
+@@ -4256,6 +4541,15 @@ dp_netdev_process_rxq_port(struct dp_netdev_pmd_thread *pmd,
+         qlen_p = &rem_qlen;
+     }
+ 
++#ifdef HAVE_XPF
++	rx_pre_arg.pkt_batch = NULL;
++	rx_pre_arg.core_id = pmd->core_id;
++	rx_pre_arg.in_port = port_no;
++	rx_pre_arg.dp = pmd->dp;
++	rx_pre_arg.pmd = pmd;
++	xpf_hook_run_without_filter(hook_provider_ovs_pkt, PKT_HOOK_RX_PRE, &rx_pre_arg);
++#endif
++
+     error = netdev_rxq_recv(rxq->rx, &batch, qlen_p);
+     if (!error) {
+         /* At least one packet received. */
+@@ -4274,6 +4568,16 @@ dp_netdev_process_rxq_port(struct dp_netdev_pmd_thread *pmd,
+                 }
+             }
+         }
++
++#ifdef HAVE_XPF
++		hook_arg.pkt_batch = &batch;
++		hook_arg.core_id = pmd->core_id;
++		hook_arg.in_port = port_no;
++		hook_arg.dp = pmd->dp;
++		hook_arg.pmd = pmd;
++		xpf_hook_run_without_filter(hook_provider_ovs_pkt, PKT_HOOK_RX_POST, &hook_arg);
++#endif
++
+         /* Process packet batch. */
+         dp_netdev_input(pmd, &batch, port_no);
+ 
+@@ -4857,7 +5161,15 @@ reconfigure_datapath(struct dp_netdev *dp)
+             seq_change(dp->port_seq);
+             port_destroy(port);
+         } else {
++#ifdef HAVE_XPF
++			if (netdev_is_hwoff(port->netdev)) {
++				port->dynamic_txqs = false;
++			} else {
++				port->dynamic_txqs = netdev_n_txq(port->netdev) < wanted_txqs;
++			}
++#else
+             port->dynamic_txqs = netdev_n_txq(port->netdev) < wanted_txqs;
++#endif
+         }
+     }
+ 
+@@ -6313,12 +6625,25 @@ packet_batch_per_flow_execute(struct packet_batch_per_flow *batch,
+ {
+     struct dp_netdev_actions *actions;
+     struct dp_netdev_flow *flow = batch->flow;
++#ifdef HAVE_XPF
++	struct dp_pkt_hook_fwd_arg hook_arg;
++#endif
+ 
+     dp_netdev_flow_used(flow, batch->array.count, batch->byte_count,
+                         batch->tcp_flags, pmd->ctx.now / 1000);
+ 
+     actions = dp_netdev_flow_get_actions(flow);
+-
++#ifdef HAVE_XPF
++	hook_arg.pkt_batch = &batch->array;
++	hook_arg.actions = actions->actions;
++	hook_arg.actions_size = actions->size;
++	hook_arg.core_id = pmd->core_id;
++	hook_arg.flow_ufid = &flow->ufid;
++	hook_arg.dp = pmd->dp;
++	hook_arg.flow = flow;
++	xpf_hook_run_without_filter(hook_provider_ovs_pkt, PKT_HOOK_FWD, &hook_arg);
++#endif
++	
+     dp_netdev_execute_actions(pmd, &batch->array, true, &flow->flow,
+                               actions->actions, actions->size);
+ }
+@@ -6812,12 +7137,12 @@ dp_netdev_input__(struct dp_netdev_pmd_thread *pmd,
+ 
+     /* All the flow batches need to be reset before any call to
+      * packet_batch_per_flow_execute() as it could potentially trigger
+-     * recirculation. When a packet matching flow ‘j’ happens to be
++     * recirculation. When a packet matching flow 'j' happens to be
+      * recirculated, the nested call to dp_netdev_input__() could potentially
+      * classify the packet as matching another flow - say 'k'. It could happen
+      * that in the previous call to dp_netdev_input__() that same flow 'k' had
+      * already its own batches[k] still waiting to be served.  So if its
+-     * ‘batch’ member is not reset, the recirculated packet would be wrongly
++     * 'batch' member is not reset, the recirculated packet would be wrongly
+      * appended to batches[k] of the 1st call to dp_netdev_input__(). */
+     for (i = 0; i < n_batches; i++) {
+         batches[i].flow->batch = NULL;
+@@ -7014,6 +7339,14 @@ dp_execute_cb(void *aux_, struct dp_packet_batch *packets_,
+         if (OVS_LIKELY(p)) {
+             struct dp_packet *packet;
+             struct dp_packet_batch out;
++#ifdef HAVE_XPF
++			struct dp_pkt_hook_fwd_post_arg hook_arg;
++
++			hook_arg.pkt_batch = packets_;
++			hook_arg.core_id = pmd->core_id;
++			hook_arg.dp = pmd->dp;
++			xpf_hook_run_without_filter(hook_provider_ovs_pkt, PKT_HOOK_FWD_POST, &hook_arg);
++#endif
+ 
+             if (!should_steal) {
+                 dp_packet_batch_clone(&out, packets_);
+@@ -7392,11 +7725,32 @@ dpif_netdev_ct_flush(struct dpif *dpif, const uint16_t *zone,
+                      const struct ct_dpif_tuple *tuple)
+ {
+     struct dp_netdev *dp = get_dp_netdev(dpif);
++	int ret = 0;
++#ifdef HAVE_XPF
++	struct dp_flow_hook_ct_flush_arg hook_arg;
++
++	hook_arg.zone = (uint16_t *)zone;
++	if (tuple != NULL) {
++		hook_arg.sip = (uint8_t *)&tuple->src;
++		hook_arg.dip = (uint8_t *)&tuple->dst;
++	} else {
++		hook_arg.sip = NULL;
++		hook_arg.dip = NULL;
++	}
++	xpf_hook_run_without_filter(hook_provider_ovs_flow, FLOW_HOOK_FLUSH_CT_PREV, &hook_arg);
++#endif
+ 
+     if (tuple) {
+-        return conntrack_flush_tuple(dp->conntrack, tuple, zone ? *zone : 0);
+-    }
+-    return conntrack_flush(dp->conntrack, zone);
++#ifdef HAVE_XPF
++        ret = conntrack_flush_tuple(dp->conntrack, tuple, zone ? *zone : 0);
++    } else {
++#endif
++		ret = conntrack_flush(dp->conntrack, zone);
++	}
++#ifdef HAVE_XPF
++	xpf_hook_run_without_filter(hook_provider_ovs_flow, FLOW_HOOK_FLUSH_CT_POST, &hook_arg);
++#endif
++    return ret;
+ }
+ 
+ static int
+@@ -7982,3 +8336,218 @@ dpcls_lookup(struct dpcls *cls, const struct netdev_flow_key *keys[],
+     }
+     return false;
+ }
++
++#ifdef HAVE_XPF
++static void
++dp_netdev_sync_flow_stats_by_ufid(void *dp, unsigned core_id, ovs_u128 *ufid,
++								  int cnt, int size, uint16_t tcp_flags, long long now)
++{
++	struct dp_netdev_pmd_thread *pmd;
++	struct dp_netdev_flow *netdev_flow;
++	long long last_used;
++
++	pmd = dp_netdev_get_pmd(dp, core_id);
++	if (pmd == NULL) {
++		return;
++	}
++
++	netdev_flow = dp_netdev_pmd_find_flow(pmd, ufid, NULL, 0);
++	if (netdev_flow == NULL) {
++		dp_netdev_pmd_unref(pmd);
++		return;
++	}
++
++	atomic_read_relaxed(&netdev_flow->stats.used, &last_used);
++	if (now > last_used) {
++		last_used = now;
++	}
++
++	dp_netdev_flow_used(netdev_flow, cnt, size, tcp_flags, last_used);
++	dp_netdev_pmd_unref(pmd);
++}
++
++static void dp_netdev_set_flow_offload(void *flow, bool value)
++{
++	if (flow == NULL) {
++		return;
++	}
++
++	((struct dp_netdev_flow *)flow)->offloadable = value;
++}
++
++static bool dp_netdev_flow_is_able_to_offload(void *flow, void *dp, unsigned core_id, ovs_u128 *ufid)
++{
++	struct dp_netdev_flow *netdev_flow = flow;
++	struct dp_netdev_pmd_thread *pmd = NULL;
++
++	if (netdev_flow != NULL ) {
++		return !netdev_flow->dead && netdev_flow->offloadable;
++	}
++
++	if (dp == NULL || ufid == NULL) {
++		return false;
++	}
++
++	pmd = dp_netdev_get_pmd(dp, core_id);
++	if (pmd == NULL) {
++		return false;
++	}
++
++	netdev_flow = dp_netdev_pmd_find_flow(pmd, ufid, NULL, 0);
++	if (netdev_flow == NULL) {
++		dp_netdev_pmd_unref(pmd);
++		return false;
++	}
++	
++	if (!netdev_flow->offloadable || netdev_flow->dead) {
++		dp_netdev_pmd_unref(pmd);
++		return false;
++	}
++
++	dp_netdev_pmd_unref(pmd);
++	return true;
++}
++
++static void ife_io_agent_tx_cb(void *pmd, void *pkt_batch, uint32_t output_port)
++{
++	struct dp_netdev_pmd_thread *pmd_ = pmd;
++	struct dp_packet_batch *packets_ = pkt_batch;
++	struct tx_port *p;
++
++	p = pmd_send_port_cache_lookup(pmd_, output_port);
++	if (OVS_LIKELY(p)) {
++		struct dp_packet *packet;
++
++		if (dp_packet_batch_size(&p->output_pkts)
++			+ dp_packet_batch_size(packets_) > NETDEV_MAX_BURST) {
++			/* Flush here to avoid overflow */
++			dp_netdev_pmd_flush_output_on_port(pmd_, p);
++		}
++
++		if (dp_packet_batch_is_empty(&p->output_pkts)) {
++			pmd_->n_output_batches++;
++		}
++
++		DP_PACKET_BATCH_FOR_EACH (i, packet, packets_) {
++			p->output_pkts_rxqs[dp_packet_batch_size(&p->output_pkts)] = 
++														pmd_->ctx.last_rxq;
++			dp_packet_batch_add(&p->output_pkts, packet);
++		}
++		return;
++	}
++
++	dp_packet_delete_batch(packets_, true);
++}
++
++static int dp_netdev_public(struct xpf_component *comp OVS_UNUSED, struct xpf_component_arg *arg)
++{
++	int ret = 0;
++
++	if (arg->version != XPF_COMPONENT_DP_NETDEV_ARG_VERSION) {
++		return -1;
++	}
++
++	switch (arg->op) {
++		case COM_DP_NETDEV_OP_SYNC_FLOW_STATS: {
++			struct com_dp_netdev_sync_stats_arg *xarg = (struct com_dp_netdev_sync_stats_arg *)arg;
++			dp_netdev_sync_flow_stats_by_ufid(xarg->in.dp, xarg->in.core_id, xarg->in.ufid, xarg->in.cnt,
++											  xarg->in.size, xarg->in.tcp_flags, xarg->in.now);
++			break;							   
++		}
++		case COM_DP_NETDEV_OP_ENABLE_FLOW_OFFLOAD:
++		case COM_DP_NETDEV_OP_DISABLE_FLOW_OFFLOAD: {
++			struct com_dp_netdev_set_offload_arg *xarg = (struct com_dp_netdev_set_offload_arg *)arg;
++			dp_netdev_set_flow_offload(xarg->in.flow, xarg->in.value);
++			break;
++		}
++		case COM_DP_NETDEV_OP_CHECK_FLOW_OFFLOAD: {
++			struct com_dp_netdev_check_offload_arg *xarg = (struct com_dp_netdev_check_offload_arg *)arg;
++			xarg->out.ret = dp_netdev_flow_is_able_to_offload(xarg->in.flow, xarg->in.dp, xarg->in.core_id,
++															  xarg->in.ufid);
++			break;
++		}
++		case COM_DP_NETDEV_OP_LOOKUP_NETDEV: {
++			struct com_dp_netdev_get_netdev_arg *xarg = (struct com_dp_netdev_get_netdev_arg *)arg;
++			struct dp_netdev_port *port = dp_netdev_lookup_port(xarg->in.dp, xarg->in.port_no);
++
++			if (port == NULL) {
++				ret = -1;
++				break;
++			}
++
++			xarg->out.info->dev_name = port->netdev->name;
++			xarg->out.info->class_name = port->netdev->netdev_class->type;
++			xarg->out.info->class_id = (uint64_t)port->netdev->netdev_class;
++			if (netdev_vport_is_vport_class(port->netdev->netdev_class)) {
++				xarg->out.info->ifindex = 0;
++			} else {
++				xarg->out.info->ifindex = netdev_get_ifindex(port->netdev);
++			}
++			break;
++		}
++		case COM_DP_NETDEV_OP_GET_DP: {
++			struct com_dp_netdev_get_dp_arg *xarg = (struct com_dp_netdev_get_dp_arg *)arg;
++			struct dp_netdev *dp = shash_find_data(&dp_netdevs, xarg->in.name);
++			if (dp == NULL) {
++				ret = -1;
++			} else {
++				xarg->out.dp = dp;
++				ovs_refcount_ref(&dp->ref_cnt);
++			}
++			break;
++		}
++		case COM_DP_NETDEV_OP_PUT_DP: {
++			struct com_dp_netdev_put_dp_arg	*xarg = (struct com_dp_netdev_put_dp_arg *)arg;
++			dp_netdev_unref((struct dp_netdev *)xarg->in.dp);
++			break;
++		}
++		case COM_DP_NETDEV_OP_DP_TO_CT: {
++			struct com_dp_netdev_dp_to_ct_arg *xarg = (struct com_dp_netdev_dp_to_ct_arg *)arg;
++			xarg->out.ct = ((struct dp_netdev *)xarg->in.dp)->conntrack;
++			break;
++		}
++		case COM_DP_NETDEV_OP_GET_TX_CB: {
++			struct com_dp_netdev_get_tx_cb_arg *xarg = (struct com_dp_netdev_get_tx_cb_arg *)arg;
++			xarg->out.cb = ife_io_agent_tx_cb;
++			break;
++		}
++		case COM_DP_NETDEV_OP_GET_MP: {
++			struct com_dp_netdev_get_mp_arg *xarg = (struct com_dp_netdev_get_mp_arg *)arg;
++			struct rte_mempool *mp = dpdk_shared_mp_get();
++			if (mp == NULL) {
++				ret = -1;
++			} else {
++				xarg->out.mp = mp;
++			}
++			break;
++		}
++	}
++
++	return ret;
++}
++
++static struct xpf_component_class dp_netdev_mod = {
++	.name = "ovs-netdev",
++	.id = COM_OVS_NETDEV,
++	.provide_ops = dp_netdev_public,
++};
++
++extern void xpf_hook_init(void);
++
++
++void dpif_netdev_init_xpf(void)
++{
++
++	xpf_hook_init();
++    xpf_component_init();
++
++	hook_provider_ovs_pkt = xpf_hook_provider_register(XPF_HOOK_PROVIDER_OVS_NETDEV_PKT);
++	hook_provider_ovs_flow = xpf_hook_provider_register(XPF_HOOK_PROVIDER_OVS_NETDEV_FLOW);
++
++	if (xpf_component_register(&dp_netdev_mod)) {
++		VLOG_ERR("Failed to register ovs-netdev component.");
++	}
++
++	VLOG_INFO("Register xpf component ovs-netdev success.");
++}
++#endif
+diff --git a/lib/dpif-netdev.h b/lib/dpif-netdev.h
+index 6db6ed2e2..edbb11910 100644
+--- a/lib/dpif-netdev.h
++++ b/lib/dpif-netdev.h
+@@ -34,6 +34,7 @@ extern "C" {
+ enum { DP_NETDEV_HEADROOM = 2 + VLAN_HEADER_LEN };
+ 
+ bool dpif_is_netdev(const struct dpif *);
++odp_port_t dpif_netdev_get_odp_no_by_name(const char *devname);
+ 
+ #define NR_QUEUE   1
+ #define NR_PMD_THREADS 1
+@@ -42,4 +43,7 @@ bool dpif_is_netdev(const struct dpif *);
+ }
+ #endif
+ 
++void *get_hook_ovs_flow(void);
++void *get_hook_ovs_pkt(void);
++
+ #endif /* netdev.h */
+diff --git a/lib/mac-learning.c b/lib/mac-learning.c
+index f6183480d..b9cc79d3d 100644
+--- a/lib/mac-learning.c
++++ b/lib/mac-learning.c
+@@ -35,6 +35,94 @@ COVERAGE_DEFINE(mac_learning_expired);
+ COVERAGE_DEFINE(mac_learning_evicted);
+ COVERAGE_DEFINE(mac_learning_moved);
+ 
++#ifdef HAVE_XPF
++struct migrate_rarp_macs hwoff_rarp_record;
++bool rarp_record_enabled = false;
++
++struct migrate_rarp_mac_entry *rarp_mac_lookup(struct eth_addr mac)
++{
++	struct migrate_rarp_mac_entry *e = NULL;
++
++	if (!rarp_record_enabled) {
++		return NULL;
++	}
++
++	HMAP_FOR_EACH_WITH_HASH (e, hmap_node, hash_mac(mac, 0, 0),
++							 &hwoff_rarp_record.table) {
++		if (eth_addr_equals(e->mac, mac)) {
++			break;
++		}
++	}
++
++	return e;
++}
++
++struct migrate_rarp_mac_entry *rarp_mac_insert(struct eth_addr mac)
++{
++	struct migrate_rarp_mac_entry *e = NULL;
++	uint32_t hash;
++
++	if (!rarp_record_enabled) {
++		return NULL;
++	}
++
++	if (hwoff_rarp_record.count >= MIGRATE_MAC_MAX) {
++		return NULL;
++	}
++
++	e = rarp_mac_lookup(mac);
++	if (!e) {
++		hash = hash_mac(mac, 0, 0);
++		e = xmalloc(sizeof(*e));
++		if (e == NULL) {
++			return NULL;
++		}
++
++		e->need_del_flow = true;
++		memcpy(&e->mac.ea, &mac.ea, ETH_ADDR_LEN);
++		hmap_insert(&hwoff_rarp_record.table, &e->hmap_node, hash);
++		hwoff_rarp_record.count++;
++	} else {
++		e->need_del_flow = true;
++	}
++
++	return e;
++}
++
++void rarp_mac_remove(struct migrate_rarp_mac_entry *e)
++{
++	if (!rarp_record_enabled) {
++		return;
++	}
++	hmap_remove(&hwoff_rarp_record.table, &e->hmap_node);
++	free(e);
++	hwoff_rarp_record.count--;
++}
++
++void rarp_mac_table_init(void)
++{
++	hmap_init(&hwoff_rarp_record.table);
++	ovs_rwlock_init(&hwoff_rarp_record.rwlock);
++	hwoff_rarp_record.count = 0;
++	rarp_record_enabled = true;
++}
++
++void rarp_mac_table_uninit(void)
++{
++	struct migrate_rarp_mac_entry *e = NULL;
++	struct migrate_rarp_mac_entry *next = NULL;
++
++	rarp_record_enabled = false;
++	ovs_rwlock_wrlock(&hwoff_rarp_record.rwlock);
++	HMAP_FOR_EACH_SAFE (e, next, hmap_node, &hwoff_rarp_record.table) {
++		rarp_mac_remove(e);
++	}
++	hmap_destroy(&hwoff_rarp_record.table);
++	hwoff_rarp_record.count = 0;
++	ovs_rwlock_unlock(&hwoff_rarp_record.rwlock);
++}
++#endif
++
+ /* Returns the number of seconds since 'e' (within 'ml') was last learned. */
+ int
+ mac_entry_age(const struct mac_learning *ml, const struct mac_entry *e)
+diff --git a/lib/mac-learning.h b/lib/mac-learning.h
+index ad2f1fe4e..48dbd9bee 100644
+--- a/lib/mac-learning.h
++++ b/lib/mac-learning.h
+@@ -118,6 +118,35 @@ struct mac_entry {
+     struct ovs_list port_lru_node; /* In mac_learning_port's "port_lru"s. */
+ };
+ 
++#ifdef HAVE_XPF
++#define MIGRATE_MAC_MAX 8192
++
++struct migrate_rarp_mac_entry {
++	struct hmap_node hmap_node;
++	struct eth_addr mac;
++	bool need_del_flow;
++};
++
++struct migrate_rarp_macs {
++	struct hmap table;
++	uint64_t count;
++	struct ovs_rwlock rwlock;
++};
++
++struct migrate_rarp_mac_entry *rarp_mac_lookup(struct eth_addr mac);
++
++struct migrate_rarp_mac_entry *rarp_mac_insert(struct eth_addr mac);
++
++void rarp_mac_remove(struct migrate_rarp_mac_entry *e);
++
++void rarp_mac_table_init(void);
++
++void rarp_mac_table_uninit(void);
++
++extern struct migrate_rarp_macs hwoff_rarp_record;
++extern bool rarp_record_enabled;
++#endif
++
+ static inline void *mac_entry_get_port(const struct mac_learning *ml,
+                                        const struct mac_entry *);
+ void mac_entry_set_port(struct mac_learning *, struct mac_entry *, void *port);
+diff --git a/lib/netdev-dpdk.c b/lib/netdev-dpdk.c
+index 48057835f..44c95cc50 100644
+--- a/lib/netdev-dpdk.c
++++ b/lib/netdev-dpdk.c
+@@ -66,6 +66,9 @@
+ #include "unixctl.h"
+ #include "util.h"
+ #include "uuid.h"
++#ifdef HAVE_XPF
++#include "xpf_config.h"
++#endif
+ 
+ enum {VIRTIO_RXQ, VIRTIO_TXQ, VIRTIO_QNUM};
+ 
+@@ -83,12 +86,12 @@ static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 20);
+  * The minimum mbuf size is limited to avoid scatter behaviour and drop in
+  * performance for standard Ethernet MTU.
+  */
+-#define ETHER_HDR_MAX_LEN           (ETHER_HDR_LEN + ETHER_CRC_LEN \
++#define ETHER_HDR_MAX_LEN           (RTE_ETHER_HDR_LEN + RTE_ETHER_CRC_LEN \
+                                      + (2 * VLAN_HEADER_LEN))
+-#define MTU_TO_FRAME_LEN(mtu)       ((mtu) + ETHER_HDR_LEN + ETHER_CRC_LEN)
++#define MTU_TO_FRAME_LEN(mtu)       ((mtu) + RTE_ETHER_HDR_LEN + RTE_ETHER_CRC_LEN)
+ #define MTU_TO_MAX_FRAME_LEN(mtu)   ((mtu) + ETHER_HDR_MAX_LEN)
+ #define FRAME_LEN_TO_MTU(frame_len) ((frame_len)                    \
+-                                     - ETHER_HDR_LEN - ETHER_CRC_LEN)
++                                     - RTE_ETHER_HDR_LEN - RTE_ETHER_CRC_LEN)
+ #define NETDEV_DPDK_MBUF_ALIGN      1024
+ #define NETDEV_DPDK_MAX_PKT_LEN     9728
+ 
+@@ -190,6 +193,9 @@ static const struct rte_eth_conf port_conf = {
+     },
+ };
+ 
++/* shared mempool define */
++static struct dpdk_mp *g_dpdk_shared_mp = NULL;
++
+ /*
+  * These callbacks allow virtio-net devices to be added to vhost ports when
+  * configuration has been fully completed.
+@@ -615,7 +621,7 @@ dpdk_calculate_mbufs(struct netdev_dpdk *dev, int mtu, bool per_port_mp)
+          * can change dynamically at runtime. For now, use this rough
+          * heurisitic.
+          */
+-        if (mtu >= ETHER_MTU) {
++        if (mtu >= RTE_ETHER_MTU) {
+             n_mbufs = MAX_NB_MBUF;
+         } else {
+             n_mbufs = MIN_NB_MBUF;
+@@ -770,7 +776,6 @@ dpdk_mp_get(struct netdev_dpdk *dev, int mtu, bool per_port_mp)
+     }
+     /* Sweep mempools after reuse or before create. */
+     dpdk_mp_sweep();
+-
+     if (!reuse) {
+         dmp = dpdk_mp_create(dev, mtu, per_port_mp);
+         if (dmp) {
+@@ -801,9 +806,46 @@ dpdk_mp_get(struct netdev_dpdk *dev, int mtu, bool per_port_mp)
+     return dmp;
+ }
+ 
++int dpdk_shared_mp_init(void)
++{
++	struct netdev_dpdk dev;
++	uint32_t buf_size;
++	bool per_port_mp = false;
++	struct dpdk_mp *dmp = NULL;
++
++	dev.up.name = "dummy_netdev_dpdk";
++#ifdef HAVE_XPF
++	dev.requested_mtu = ETH_EVS_MTU;
++#else
++	dev.requested_mtu = RTE_ETHER_MTU;
++#endif
++	dev.requested_socket_id = rte_lcore_to_socket_id(rte_get_master_lcore());
++	buf_size = dpdk_buf_size(dev.requested_mtu);
++	dmp = dpdk_mp_get(&dev, FRAME_LEN_TO_MTU(buf_size), per_port_mp);
++	if (dmp == NULL) {
++		VLOG_ERR("DPDK shared memory pool initiation is failed!");
++		return -1;
++	}
++
++	VLOG_INFO("Created shared memory %s at socket %d, mtu %u, buf_size %u",
++		dmp->mp->name, dev.requested_socket_id, dev.requested_mtu, buf_size);
++
++	g_dpdk_shared_mp = dmp;
++
++	return 0;
++}
++
++struct rte_mempool *dpdk_shared_mp_get(void)
++{
++	if (g_dpdk_shared_mp == NULL) {
++		VLOG_ERR("DPDK shared rte_memory pool for netdev is NULL");
++		return NULL;
++	}
++	return g_dpdk_shared_mp->mp;
++}
++
+ /* Decrement reference to a mempool. */
+-static void
+-dpdk_mp_put(struct dpdk_mp *dmp)
++static void dpdk_mp_put(struct dpdk_mp *dmp)
+ {
+     if (!dmp) {
+         return;
+@@ -815,6 +857,21 @@ dpdk_mp_put(struct dpdk_mp *dmp)
+     ovs_mutex_unlock(&dpdk_mp_mutex);
+ }
+ 
++void dpdk_shared_mp_uninit(void)
++{
++	if (g_dpdk_shared_mp == NULL) {
++		return;
++	}
++	dpdk_mp_put(g_dpdk_shared_mp);
++	ovs_mutex_lock(&dpdk_mp_mutex);
++	if (!g_dpdk_shared_mp->refcount && dpdk_mp_full(g_dpdk_shared_mp->mp)) {
++		VLOG_INFO("Deleting shared memory pool %s", g_dpdk_shared_mp->mp->name);
++	}
++	dpdk_mp_sweep();
++	ovs_mutex_unlock(&dpdk_mp_mutex);
++	g_dpdk_shared_mp = NULL;
++}
++
+ /* Depending on the memory model being used this function tries to
+  * identify and reuse an existing mempool or tries to allocate a new
+  * mempool on requested_socket_id with mbuf size corresponding to the
+@@ -930,7 +987,7 @@ dpdk_eth_dev_port_config(struct netdev_dpdk *dev, int n_rxq, int n_txq)
+      * scatter to support jumbo RX.
+      * Setting scatter for the device is done after checking for
+      * scatter support in the device capabilites. */
+-    if (dev->mtu > ETHER_MTU) {
++    if (dev->mtu > RTE_ETHER_MTU) {
+         if (dev->hw_ol_features & NETDEV_RX_HW_SCATTER) {
+             conf.rxmode.offloads |= DEV_RX_OFFLOAD_SCATTER;
+         }
+@@ -1042,7 +1099,7 @@ dpdk_eth_dev_init(struct netdev_dpdk *dev)
+ {
+     struct rte_pktmbuf_pool_private *mbp_priv;
+     struct rte_eth_dev_info info;
+-    struct ether_addr eth_addr;
++    struct rte_ether_addr eth_addr;
+     int diag;
+     int n_rxq, n_txq;
+     uint32_t rx_chksm_offload_capa = DEV_RX_OFFLOAD_UDP_CKSUM |
+@@ -1167,7 +1224,7 @@ common_construct(struct netdev *netdev, dpdk_port_t port_no,
+     dev->port_id = port_no;
+     dev->type = type;
+     dev->flags = 0;
+-    dev->requested_mtu = ETHER_MTU;
++    dev->requested_mtu = RTE_ETHER_MTU;
+     dev->max_packet_len = MTU_TO_FRAME_LEN(dev->mtu);
+     dev->requested_lsc_interrupt_mode = 0;
+     ovsrcu_index_init(&dev->vid, -1);
+@@ -1321,6 +1378,9 @@ netdev_dpdk_vhost_construct(struct netdev *netdev)
+     err = rte_vhost_driver_disable_features(dev->vhost_id,
+                                 1ULL << VIRTIO_NET_F_HOST_TSO4
+                                 | 1ULL << VIRTIO_NET_F_HOST_TSO6
++#ifdef HAVE_XPF
++								| 1ULL << VIRTIO_NET_F_GUEST_ANNOUNCE
++#endif
+                                 | 1ULL << VIRTIO_NET_F_CSUM);
+     if (err) {
+         VLOG_ERR("rte_vhost_driver_disable_features failed for vhost user "
+@@ -1694,7 +1754,7 @@ netdev_dpdk_get_port_by_mac(const char *mac_str)
+     }
+ 
+     RTE_ETH_FOREACH_DEV (port_id) {
+-        struct ether_addr ea;
++        struct rte_ether_addr ea;
+ 
+         rte_eth_macaddr_get(port_id, &ea);
+         memcpy(port_mac.ea, ea.addr_bytes, ETH_ADDR_LEN);
+@@ -2077,10 +2137,10 @@ netdev_dpdk_policer_pkt_handle(struct rte_meter_srtcm *meter,
+                                struct rte_meter_srtcm_profile *profile,
+                                struct rte_mbuf *pkt, uint64_t time)
+ {
+-    uint32_t pkt_len = rte_pktmbuf_pkt_len(pkt) - sizeof(struct ether_hdr);
++    uint32_t pkt_len = rte_pktmbuf_pkt_len(pkt) - sizeof(struct rte_ether_hdr);
+ 
+     return rte_meter_srtcm_color_blind_check(meter, profile, time, pkt_len) ==
+-                                             e_RTE_METER_GREEN;
++                                             RTE_COLOR_GREEN;
+ }
+ 
+ static int
+@@ -2623,7 +2683,7 @@ netdev_dpdk_set_mtu(struct netdev *netdev, int mtu)
+      * a method to retrieve the upper bound MTU for a given device.
+      */
+     if (MTU_TO_MAX_FRAME_LEN(mtu) > NETDEV_DPDK_MAX_PKT_LEN
+-        || mtu < ETHER_MIN_MTU) {
++        || mtu < RTE_ETHER_MIN_MTU) {
+         VLOG_WARN("%s: unsupported MTU %d\n", dev->up.name, mtu);
+         return EINVAL;
+     }
+@@ -4329,6 +4389,9 @@ netdev_dpdk_vhost_client_reconfigure(struct netdev *netdev)
+         err = rte_vhost_driver_disable_features(dev->vhost_id,
+                                     1ULL << VIRTIO_NET_F_HOST_TSO4
+                                     | 1ULL << VIRTIO_NET_F_HOST_TSO6
++#ifdef HAVE_XPF
++									| 1ULL << VIRTIO_NET_F_GUEST_ANNOUNCE
++#endif
+                                     | 1ULL << VIRTIO_NET_F_CSUM);
+         if (err) {
+             VLOG_ERR("rte_vhost_driver_disable_features failed for vhost user "
+diff --git a/lib/netdev-dpdk.h b/lib/netdev-dpdk.h
+index 60631c4f0..c33aaee00 100644
+--- a/lib/netdev-dpdk.h
++++ b/lib/netdev-dpdk.h
+@@ -20,6 +20,7 @@
+ #include <config.h>
+ 
+ #include "openvswitch/compiler.h"
++#include "rte_mempool.h"
+ 
+ struct dp_packet;
+ struct netdev;
+@@ -47,6 +48,9 @@ netdev_dpdk_rte_flow_create(struct netdev *netdev,
+                             const struct rte_flow_item *items,
+                             const struct rte_flow_action *actions,
+                             struct rte_flow_error *error);
++int dpdk_shared_mp_init(void);
++void dpdk_shared_mp_uninit(void);
++struct rte_mempool *dpdk_shared_mp_get(void);
+ 
+ #else
+ 
+diff --git a/lib/netdev-provider.h b/lib/netdev-provider.h
+index 1e5a40c89..5c736723e 100644
+--- a/lib/netdev-provider.h
++++ b/lib/netdev-provider.h
+@@ -113,6 +113,8 @@ void netdev_get_devices(const struct netdev_class *,
+                         struct shash *device_list);
+ struct netdev **netdev_get_vports(size_t *size);
+ 
++void netdev_get_devices_by_type(const char *type, struct shash *device_list);
++
+ /* A data structure for capturing packets received by a network device.
+  *
+  * Network device implementations may read these members but should not modify
+diff --git a/lib/netdev.c b/lib/netdev.c
+index b1976d365..25e1f8156 100644
+--- a/lib/netdev.c
++++ b/lib/netdev.c
+@@ -125,6 +125,19 @@ netdev_is_pmd(const struct netdev *netdev)
+     return netdev->netdev_class->is_pmd;
+ }
+ 
++#ifdef HAVE_XPF
++bool
++netdev_is_hwoff(const struct netdev *netdev)
++{
++	if (!strncmp(netdev->netdev_class->type, "hwbond", strlen("hwbond")) ||
++		!strncmp(netdev->netdev_class->type, "virtio_vf", strlen("virtio_vf"))) {
++		return true;
++	}
++
++	return false;
++}
++#endif
++
+ bool
+ netdev_has_tunnel_push_pop(const struct netdev *netdev)
+ {
+@@ -216,6 +229,27 @@ netdev_lookup_class(const char *type)
+     return NULL;
+ }
+ 
++/* Extracts pointers to all 'netdev-offload' into an shash
++ *
++ * The caller must close
++ * each 'netdev-offload' in the list. */
++void netdev_get_devices_by_type(const char *type, struct shash *device_list)
++	OVS_EXCLUDED(netdev_mutex)
++{
++	struct shash_node *node;
++	struct netdev *dev = NULL;
++
++	ovs_mutex_lock(&netdev_mutex);
++	SHASH_FOR_EACH (node, &netdev_shash) {
++		dev = node->data;
++		if (!strcmp(dev->netdev_class->type, type)) {
++			dev->ref_cnt++;
++			shash_add(device_list, dev->name, dev);
++		}
++	}
++	ovs_mutex_unlock(&netdev_mutex);
++}
++
+ /* Initializes and registers a new netdev provider.  After successful
+  * registration, new netdevs of that type can be opened using netdev_open(). */
+ int
+diff --git a/lib/netdev.h b/lib/netdev.h
+index fdbe0e1f5..2c98ef3cd 100644
+--- a/lib/netdev.h
++++ b/lib/netdev.h
+@@ -150,6 +150,7 @@ bool netdev_is_reserved_name(const char *name);
+ int netdev_n_txq(const struct netdev *netdev);
+ int netdev_n_rxq(const struct netdev *netdev);
+ bool netdev_is_pmd(const struct netdev *netdev);
++bool netdev_is_hwoff(const struct netdev *netdev);
+ bool netdev_has_tunnel_push_pop(const struct netdev *netdev);
+ 
+ /* Open and close. */
+diff --git a/lib/ovs-atomic.h b/lib/ovs-atomic.h
+index 11fa19268..03687892f 100644
+--- a/lib/ovs-atomic.h
++++ b/lib/ovs-atomic.h
+@@ -329,10 +329,10 @@
+         #include "ovs-atomic-c++.h"
+     #elif HAVE_STDATOMIC_H && !defined(__cplusplus)
+         #include "ovs-atomic-c11.h"
+-    #elif __GNUC__ >= 5 && !defined(__cplusplus)
+-        #error "GCC 5+ should have <stdatomic.h>"
+     #elif __GNUC__ >= 5 || (__GNUC__ >= 4 && __GNUC_MINOR__ >= 7)
+         #include "ovs-atomic-gcc4.7+.h"
++	#elif __GNUC__ >= 5 || !defined(__cplusplus)
++		#error "GCC 5+ should have <stdatomic.h>"
+     #elif __GNUC__ && defined(__x86_64__)
+         #include "ovs-atomic-x86_64.h"
+     #elif __GNUC__ && defined(__i386__)
+diff --git a/lib/unixctl.c b/lib/unixctl.c
+index c216de3d0..1fe3827dc 100644
+--- a/lib/unixctl.c
++++ b/lib/unixctl.c
+@@ -126,6 +126,14 @@ unixctl_command_register(const char *name, const char *usage,
+     shash_add(&commands, name, command);
+ }
+ 
++void
++unixctl_command_unregister(const char *name)
++{
++	void *data = shash_find_and_delete(&commands, name);
++	free(data);
++	data = NULL;
++}
++
+ static void
+ unixctl_command_reply__(struct unixctl_conn *conn,
+                         bool success, const char *body)
+diff --git a/lib/unixctl.h b/lib/unixctl.h
+index 4562dbc49..c95b34882 100644
+--- a/lib/unixctl.h
++++ b/lib/unixctl.h
+@@ -45,6 +45,7 @@ typedef void unixctl_cb_func(struct unixctl_conn *,
+ void unixctl_command_register(const char *name, const char *usage,
+                               int min_args, int max_args,
+                               unixctl_cb_func *cb, void *aux);
++void unixctl_command_unregister(const char *name);
+ void unixctl_command_reply_error(struct unixctl_conn *, const char *error);
+ void unixctl_command_reply(struct unixctl_conn *, const char *body);
+ 
+diff --git a/lib/vlog.c b/lib/vlog.c
+index 01cfdc5d3..1e58da86f 100644
+--- a/lib/vlog.c
++++ b/lib/vlog.c
+@@ -152,7 +152,7 @@ static struct vlog_facility vlog_facilities[] = {
+ };
+ static bool vlog_facility_exists(const char* facility, int *value);
+ 
+-static void format_log_message(const struct vlog_module *, enum vlog_level,
++void format_log_message(const struct vlog_module *, enum vlog_level,
+                                const char *pattern,
+                                const char *message, va_list, struct ds *)
+     OVS_PRINTF_FORMAT(4, 0);
+@@ -946,7 +946,7 @@ fetch_braces(const char *p, const char *def, char *out, size_t out_size)
+     return p;
+ }
+ 
+-static void
++void
+ format_log_message(const struct vlog_module *module, enum vlog_level level,
+                    const char *pattern, const char *message,
+                    va_list args_, struct ds *s)
+diff --git a/ofproto/ofproto-dpif-xlate.c b/ofproto/ofproto-dpif-xlate.c
+index 0dc43d17a..f4fc57561 100644
+--- a/ofproto/ofproto-dpif-xlate.c
++++ b/ofproto/ofproto-dpif-xlate.c
+@@ -66,6 +66,7 @@
+ #include "tunnel.h"
+ #include "util.h"
+ #include "uuid.h"
++#include "dpif-provider.h"
+ 
+ COVERAGE_DEFINE(xlate_actions);
+ COVERAGE_DEFINE(xlate_actions_oversize);
+@@ -2567,6 +2568,37 @@ update_learning_table__(const struct xbridge *xbridge,
+                                     in_xbundle->ofbundle));
+ }
+ 
++#ifdef HAVE_XPF
++static bool is_reverse_arp(const struct flow *flow)
++{
++	if (flow->dl_type == htons(ETH_TYPE_RARP)) {
++		return true;
++	}
++
++	return false;
++}
++
++static void hwoff_update_learning_table(const struct xlate_ctx *ctx, struct xbundle *in_xbundle,
++										struct eth_addr dl_src, int vlan, bool is_grat_arp,
++										bool is_rarp, bool is_ipv6_nd)
++{
++	if (!update_learning_table__(ctx->xbridge, in_xbundle, dl_src, vlan,
++								 is_grat_arp)) {
++		xlate_report_debug(ctx, OFT_DETAIL, "learned that "ETH_ADDR_FMT" is "
++					       "on port %s in VLAN %d",
++						   ETH_ADDR_ARGS(dl_src), in_xbundle->name, vlan);
++		if (rarp_record_enabled
++			&& (!strcmp(ctx->xbridge->dpif->dpif_class->type, "netdev"))
++			&& (unlikely(is_rarp) || unlikely(is_grat_arp) || unlikely(is_ipv6_nd))) {
++			ovs_rwlock_wrlock(&hwoff_rarp_record.rwlock);
++			rarp_mac_insert(dl_src);
++			ovs_rwlock_unlock(&hwoff_rarp_record.rwlock);
++		}
++	}
++}
++
++#else
++
+ static void
+ update_learning_table(const struct xlate_ctx *ctx,
+                       struct xbundle *in_xbundle, struct eth_addr dl_src,
+@@ -2579,6 +2611,7 @@ update_learning_table(const struct xlate_ctx *ctx,
+                            ETH_ADDR_ARGS(dl_src), in_xbundle->name, vlan);
+     }
+ }
++#endif
+ 
+ /* Updates multicast snooping table 'ms' given that a packet matching 'flow'
+  * was received on 'in_xbundle' in 'vlan' and is either Report or Query. */
+@@ -2983,12 +3016,20 @@ xlate_normal(struct xlate_ctx *ctx)
+ 
+     /* Learn source MAC. */
+     bool is_grat_arp = is_gratuitous_arp(flow, wc);
++#ifdef HAVE_XPF
++	bool is_rarp = is_reverse_arp(flow);
++	bool is_ipv6_nd = is_nd(flow, NULL);
++#endif
+     if (ctx->xin->allow_side_effects
+         && flow->packet_type == htonl(PT_ETH)
+         && in_port->pt_mode != NETDEV_PT_LEGACY_L3
+     ) {
+-        update_learning_table(ctx, in_xbundle, flow->dl_src, vlan,
+-                              is_grat_arp);
++#ifdef HAVE_XPF
++		hwoff_update_learning_table(ctx, in_xbundle, flow->dl_src, vlan,
++									is_grat_arp, is_rarp, is_ipv6_nd);
++#else
++		update_learning_table(ctx, in_xbundle, flow->dl_src, vlan, is_grat_arp);
++#endif
+     }
+     if (ctx->xin->xcache && in_xbundle != &ofpp_none_bundle) {
+         struct xc_entry *entry;
+diff --git a/vswitchd/ovs-vswitchd.c b/vswitchd/ovs-vswitchd.c
+index 1e72b628b..c169abcce 100644
+--- a/vswitchd/ovs-vswitchd.c
++++ b/vswitchd/ovs-vswitchd.c
+@@ -69,6 +69,36 @@ struct ovs_vswitchd_exit_args {
+     bool *cleanup;
+ };
+ 
++#if HAVE_XPF
++#define VENDOR_HISILICON   0x48
++#define VENDOR_ARM         0x41
++#define PART_ID_MASK       0xFFF
++#define PART_ID_OFFSET     4
++#define VENDOR_MASK        0xFF
++#define VENDOR_OFFSET      24
++
++unsigned int g_support_vendor_list[] = {VENDOR_HISILICON, VENDOR_ARM};
++static bool platform_compat_check(void)
++{
++	unsigned long int midr_el1;
++	unsigned int part_id;
++	unsigned int vendor_id;
++	unsigned int i;
++
++	asm("mrs %0, MIDR_EL1": "=r" (midr_el1));
++	part_id = (midr_el1 >> PART_ID_OFFSET) & PART_ID_MASK;
++	vendor_id = (midr_el1 >> VENDOR_OFFSET) & VENDOR_MASK;
++
++	VLOG_INFO("midr_el1=0x%016lx, part_id=0x%x, vendor_id=0x%x", midr_el1, part_id, vendor_id);
++	for (i = 0; i < ARRAY_SIZE(g_support_vendor_list); i++) {
++	    if (g_support_vendor_list[i] == vendor_id) {
++		    return true;
++		}
++	}
++	return false;
++}
++#endif
++
+ int
+ main(int argc, char *argv[])
+ {
+@@ -79,6 +109,14 @@ main(int argc, char *argv[])
+     struct ovs_vswitchd_exit_args exit_args = {&exiting, &cleanup};
+     int retval;
+ 
++#if HAVE_XPF
++	bool flag = platform_compat_check();
++	if (!flag) {
++	    VLOG_ERR("program_compatibility_check fail");
++		return -1;
++	}
++#endif
++
+     set_program_name(argv[0]);
+     ovsthread_id_init();
+ 
