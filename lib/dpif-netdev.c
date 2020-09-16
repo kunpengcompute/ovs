@@ -3296,7 +3296,7 @@ static void dp_netdev_pmd_del_flow_with_smac_except_inport(struct dp_netdev_pmd_
 }
 
 static void dp_netdev_clear_forward_flow(struct dp_netdev_pmd_thread *current_pmd,
-                                         struct eht_addr smac, uint32_t dp_in_port)
+                                         struct eth_addr smac, uint32_t dp_in_port)
 {
     struct dp_netdev_pmd_thread *pmd = NULL;
     bool is_same_pmd = false;
